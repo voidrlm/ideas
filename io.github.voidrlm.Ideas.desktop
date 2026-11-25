@@ -2,7 +2,7 @@
 Type=Application
 Name=Ideas
 GenericName=Ideas and To-Dos
-Comment=Lists of ideas and to-dos, with images and a hand-off to Claude Code
+Comment=Ideas and to-dos you can send to Claude Code, Codex or OpenRouter
 Exec=ideas
 Icon=io.github.voidrlm.Ideas
 Terminal=false

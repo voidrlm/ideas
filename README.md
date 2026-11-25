@@ -14,7 +14,7 @@ to [Claude Code](https://claude.com/claude-code) with one click. It's ticked off
 ![Linux](https://img.shields.io/badge/platform-Linux-informational)
 [![Latest release](https://img.shields.io/github/v/release/voidrlm/ideas)](https://github.com/voidrlm/ideas/releases)
 
-[Install](#install) · [Features](#features) · [Claude Code](#send-to-claude-code) · [Email](#tasks-from-gmail-and-outlook) · [Keyboard](#keyboard-and-command-line) · [FAQ](#faq)
+[Install](#install) · [Features](#features) · [Claude Code](#send-to-claude-code) · [Keyboard](#keyboard-and-command-line) · [FAQ](#faq)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="screenshots/ideas-dark.png">
@@ -67,7 +67,6 @@ cd ideas && ./install.sh
 - **Send to Claude Code, Codex or OpenRouter.** Link a list to a project folder and every to-do gets a button for each coding agent you have. [More below](#send-to-claude-code).
 - **Commit and push.** A list whose folder has uncommitted work shows a push button. It commits with a generated message and pushes, even across several repositories in one folder.
 - **Tasks from Microsoft Teams** (optional). Pulls the things people asked you to do in unread Teams chats into a list, without marking anything as read. [More below](#tasks-from-microsoft-teams).
-- **Tasks from Gmail and Outlook** (optional). The same for your unread email. [More below](#tasks-from-gmail-and-outlook).
 - **Undo** for deletes and completions, and a full set of keyboard shortcuts.
 - **Private.** Everything is kept in one JSON file on your computer. No account, no cloud, no tracking.
 
@@ -123,24 +122,6 @@ original message in the notes.
 - **No Azure app or admin consent needed.** A private Chromium (Playwright) signs in to Teams on the web once, in a window, and then runs unseen. It is set up automatically in `~/.local/share/ideas/teams-venv`.
 - **Claude Code decides what counts as a task.** New messages are passed to `claude -p` with no tools allowed. This uses your own Claude Code sign-in.
 
-## Tasks from Gmail and Outlook
-
-Choose **Check Gmail for Tasks** (<kbd>Ctrl</kbd>+<kbd>G</kbd>) or **Check Outlook for Tasks** (<kbd>Ctrl</kbd>+<kbd>O</kbd>)
-from the main menu. Ideas reads the **unread** mail in your inbox from the last 30 days and adds what
-you've been asked to do to a **Gmail** or **Outlook** list, with the sender, subject and email in the
-notes. **Open in Gmail / Outlook** in a to-do takes you to the email.
-
-- **Nothing changes in your mailbox.** Email stays unread. Over IMAP the inbox is opened read-only; with Outlook on the web only GET requests are made. Ideas keeps its own note of which emails it has looked at.
-- **Newsletters are skipped.** Mail with an unsubscribe header is never sent to Claude, and in Gmail the Promotions, Social and Forums tabs are left out.
-- **Claude Code decides what counts as a task**, as for Teams: new emails go to `claude -p` with no tools allowed.
-
-**Gmail** uses the Google account in **GNOME Settings → Online Accounts** (with *Mail* switched on).
-No password or Google Cloud project is needed; if the account isn't there, Ideas offers to open Online Accounts.
-
-**Outlook** uses a Microsoft or Microsoft 365 account from Online Accounts if you have one. Otherwise,
-choose **Sign In to Outlook…** once: like Teams, a private Chromium signs in to Outlook on the web and
-then runs unseen, so it works for work accounts without an Azure app or admin consent.
-
 ## Keyboard and command line
 
 Press <kbd>Ctrl</kbd>+<kbd>?</kbd> in the app for every shortcut.
@@ -177,7 +158,7 @@ Your lists are kept in `~/.local/share/ideas` unless you delete that folder.
 
 Bug reports and pull requests are welcome. Ideas is plain Python with no build step:
 `ideas_core.py` holds the data model (no GTK), `ideas.py` the interface, `ideas_git.py` the
-commit-and-push feature, `ideas_teams.py` the Teams reader and `ideas_mail.py` the Gmail and Outlook reader. Run `./ideas` from a clone to try your changes.
+commit-and-push feature and `ideas_teams.py` the Teams reader. Run `./ideas` from a clone to try your changes.
 
 If Ideas is useful to you, please ⭐ **star the repo**. It helps other people find it.
 

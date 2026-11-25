@@ -39,18 +39,12 @@ ITEM_DEFAULTS = {
     "images": (),             # file names in Store.images_dir (always replaced, never mutated)
     "teams_id": None,         # "<message id>@<chat id>" of the Teams message it came from
     "teams_url": None,        # link that opens that message in Teams
-    "mail_id": None,          # "gmail:<Message-ID>" or "outlook:<Message-ID>" of the email it came from
-    "mail_url": None,         # link that opens that email
 }
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 TEAMS_LIST = "Teams"          # the list Teams to-dos go to (made when first needed)
 TEAMS_CHATS_KEPT = 300        # chats whose "checked up to here" bookmark is remembered
-
-MAIL_SOURCES = {"gmail": ("Gmail", "red"), "outlook": ("Outlook", "blue")}   # list name and colour
-MAIL_KEPT_DAYS = 45           # emails looked at are remembered this long (checks look back 30 days)
-MAIL_KEPT = 3000
 
 
 def new_id():
@@ -439,50 +433,6 @@ class Store:
         if len(marks) > TEAMS_CHATS_KEPT:     # keep the chats with the newest messages
             marks = dict(sorted(marks.items(), key=lambda kv: int(kv[1]))[-TEAMS_CHATS_KEPT:])
         self.settings["teams_checked"] = marks
-        self.changed()
-        return added
-
-    # -- email (Gmail, Outlook)
-
-    def mail_request(self, source):
-        """What a mail check needs to know: the emails earlier checks looked at."""
-        return {"checked": dict(self.settings.get(f"{source}_checked") or {})}
-
-    def mail_list(self, source, create=False):
-        name, color = MAIL_SOURCES[source]
-        lst = next((x for x in self.lists if x["name"].strip().lower() == name.lower()), None)
-        if not lst and create:
-            lst = {"id": new_id(), "name": name, "color": color, "folder": None}
-            self.lists.append(lst)
-        return lst
-
-    def add_mail_tasks(self, source, tasks, checked=None):
-        """Add the to-dos a mail check found and remember which emails it looked at.  Returns the new items.
-
-        They go to the source's list ("Gmail" or "Outlook").  An email that already has a to-do
-        isn't added again.
-        """
-        have = {it["mail_id"] for it in self.items if it.get("mail_id")}
-        added = []
-        for t in tasks or []:
-            title = (t.get("title") or "").strip()
-            if not title or (t.get("mail_id") and t["mail_id"] in have):
-                continue
-            lst = self.mail_list(source, create=True)
-            prio = t.get("priority")
-            item = dict(ITEM_DEFAULTS, id=new_id(), title=title, notes=t.get("notes") or "", created=now_str(),
-                        list_id=lst["id"], priority=prio if prio in (0, 1, 2, 3) else 0, images=[],
-                        mail_id=t.get("mail_id"), mail_url=t.get("url"))
-            self.items.append(item)
-            added.append(item)
-        key = f"{source}_checked"
-        marks = dict(self.settings.get(key) or {})
-        marks.update({str(k): str(v) for k, v in (checked or {}).items()})
-        cutoff = (dt.datetime.now().astimezone() - dt.timedelta(days=MAIL_KEPT_DAYS)).isoformat(timespec="seconds")
-        marks = {k: v for k, v in marks.items() if v >= cutoff[:10]}   # ISO dates compare as text
-        if len(marks) > MAIL_KEPT:
-            marks = dict(sorted(marks.items(), key=lambda kv: kv[1])[-MAIL_KEPT:])
-        self.settings[key] = marks
         self.changed()
         return added
 

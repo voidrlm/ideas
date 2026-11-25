@@ -608,7 +608,7 @@ def run(data_dir, request, login=False, dry_run=False):
     emit(event="result", **result)
 
 
-VENV_NAME = "teams-venv"     # shared with the Outlook reader; the name is kept so existing setups are reused
+VENV_NAME = "teams-venv"
 
 
 def ensure_env(data_dir, script=None, label="Teams access", extra_args=()):
