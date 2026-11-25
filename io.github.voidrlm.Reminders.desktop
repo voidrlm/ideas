@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Reminders
+GenericName=To-Do List
+Comment=Lists, to-dos and reminders that notify you on time
+Exec=reminders
+Icon=io.github.voidrlm.Reminders
+Terminal=false
+Categories=Office;ProjectManagement;GTK;
+Keywords=todo;task;tasks;checklist;reminder;alarm;list;
+StartupNotify=true
+X-GNOME-UsesNotifications=true
+Actions=new-reminder;
+
+[Desktop Action new-reminder]
+Name=New Reminder
+Exec=reminders
