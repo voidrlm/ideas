@@ -248,20 +248,21 @@ def find_claude():
     return None
 
 
-def ask_claude(me_name, prompt):
+def run_claude(prompt, system, schema, what="the messages"):
+    """claude -p with no tools and a JSON schema for the answer.  Returns the structured answer."""
     claude = find_claude()
     if not claude:
-        raise Problem("Claude Code (the “claude” command) isn't installed, so the messages can't be sorted")
+        raise Problem(f"Claude Code (the “claude” command) isn't installed, so {what} can't be sorted")
     cmd = [claude, "-p", "--model", CLAUDE_MODEL, "--effort", "low",
            "--tools", "", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
-           "--output-format", "json", "--json-schema", json.dumps(SCHEMA),
-           "--system-prompt", system_prompt(me_name)]
+           "--output-format", "json", "--json-schema", json.dumps(schema),
+           "--system-prompt", system]
     # An empty folder, so no project instructions or memory get mixed in.
-    with tempfile.TemporaryDirectory(prefix="ideas-teams-") as cwd:
+    with tempfile.TemporaryDirectory(prefix="ideas-sort-") as cwd:
         try:
             r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=CLAUDE_TIMEOUT)
         except subprocess.TimeoutExpired:
-            raise Problem("Claude took too long to sort the messages. Try again.")
+            raise Problem(f"Claude took too long to sort {what}. Try again.")
     try:
         data = json.loads(r.stdout)
     except ValueError:
@@ -270,8 +271,12 @@ def ask_claude(me_name, prompt):
     out = data.get("structured_output")
     if r.returncode != 0 or data.get("is_error") or not isinstance(out, dict):
         why = (data.get("result") if isinstance(data.get("result"), str) else "") or r.stderr.strip() or "no answer"
-        raise Problem("Claude couldn't sort the messages: " + why.strip().splitlines()[-1][:160])
+        raise Problem(f"Claude couldn't sort {what}: " + why.strip().splitlines()[-1][:160])
     return out
+
+
+def ask_claude(me_name, prompt):
+    return run_claude(prompt, system_prompt(me_name), SCHEMA)
 
 
 def make_tasks(answer, alias, chats):
@@ -500,11 +505,11 @@ def find_chrome(playwright):
                    key=lambda p: int(re.search(r"chromium-(\d+)", p).group(1)))
     if found:
         return found[-1]
-    emit(event="status", text="Downloading a browser for Teams (one time)…", toast=True)
+    emit(event="status", text="Downloading a browser (one time)…", toast=True)
     r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], capture_output=True, text=True)
     exe = playwright.chromium.executable_path
     if r.returncode != 0 or not os.path.exists(exe):
-        raise Problem("Couldn't download a browser for Teams: " + (r.stderr.strip().splitlines() or ["unknown error"])[-1][:120])
+        raise Problem("Couldn't download a browser: " + (r.stderr.strip().splitlines() or ["unknown error"])[-1][:120])
     return exe
 
 
@@ -603,26 +608,29 @@ def run(data_dir, request, login=False, dry_run=False):
     emit(event="result", **result)
 
 
-def ensure_env(data_dir):
-    """Re-run inside a private virtualenv that has Playwright, creating it the first time."""
-    venv = os.path.join(data_dir, "teams-venv")
+VENV_NAME = "teams-venv"     # shared with the Outlook reader; the name is kept so existing setups are reused
+
+
+def ensure_env(data_dir, script=None, label="Teams access", extra_args=()):
+    """Re-run `script` inside a private virtualenv that has Playwright, creating it the first time."""
+    venv = os.path.join(data_dir, VENV_NAME)
     py = os.path.join(venv, "bin", "python")
     inside = os.path.realpath(sys.prefix) == os.path.realpath(venv)
     if not inside:
         if not os.path.exists(py):
-            emit(event="status", text="Setting up Teams access (one time, takes a minute)…", toast=True)
+            emit(event="status", text=f"Setting up {label} (one time, takes a minute)…", toast=True)
             os.makedirs(data_dir, exist_ok=True)
             r = subprocess.run([sys.executable, "-m", "venv", venv], capture_output=True, text=True)
             if r.returncode != 0:
                 shutil.rmtree(venv, ignore_errors=True)
-                raise Problem("Couldn't set up Teams access: " + (r.stderr.strip().splitlines() or ["venv failed"])[-1][:120])
+                raise Problem(f"Couldn't set up {label}: " + (r.stderr.strip().splitlines() or ["venv failed"])[-1][:120])
             os.environ["IDEAS_TEAMS_SETUP"] = "1"
-        os.execv(py, [py, os.path.abspath(__file__), *sys.argv[1:]])
+        os.execv(py, [py, os.path.abspath(script or __file__), *sys.argv[1:], *extra_args])
     try:
         import playwright  # noqa: F401
     except ImportError:
         if not os.environ.get("IDEAS_TEAMS_SETUP"):
-            emit(event="status", text="Setting up Teams access (one time, takes a minute)…", toast=True)
+            emit(event="status", text=f"Setting up {label} (one time, takes a minute)…", toast=True)
         r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "playwright"],
                            capture_output=True, text=True)
         if r.returncode != 0:
