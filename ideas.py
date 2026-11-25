@@ -908,12 +908,21 @@ class MainWindow(Adw.ApplicationWindow):
         if err:
             self.toast(err)
             return
+        # Handed off to Claude, so it's done; Undo puts the open ones back.
         stamp = core.now_str()
+        reopened = [it["id"] for it in items if not it["done"]]
         for it in items:
             it["claude_sent_at"] = stamp
+            if not it["done"]:
+                it["done"], it["completed_at"] = True, stamp
         self.store.changed()
+
+        def undo():
+            for iid in reopened:
+                self.store.set_done(iid, False)
         what = f"“{items[0]['title']}”" if len(items) == 1 else plural(len(items), "to-do")
-        self.toast(f"Sent {what} to Claude Code in {os.path.basename(lst['folder'].rstrip(os.sep))}")
+        self.toast(f"Sent {what} to Claude Code in {os.path.basename(lst['folder'].rstrip(os.sep))} and marked done",
+                   undo if reopened else None)
 
     def send_list_to_claude(self, list_id):
         ids = [it["id"] for _h, its in self.store.sections(list_id) for it in its if not it["done"]]

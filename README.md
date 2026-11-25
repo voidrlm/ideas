@@ -12,7 +12,7 @@ one-click hand-off to Claude Code.
   then gets a **Send to Claude Code** button that opens a terminal in that folder and runs
   `claude` with the to-do as the prompt. Its images go too: their paths are in the prompt and the
   image folder is passed with `--add-dir`, so Claude can open them without asking. The list menu
-  can send all open to-dos at once.
+  can send all open to-dos at once. Sent to-dos are marked done (Undo in the toast reopens them).
 - Undo for deletes and completions, keyboard shortcuts (`Ctrl+?`).
 
 ## Install
