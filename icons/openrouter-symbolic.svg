@@ -1,5 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <path fill="none" stroke="#2e3436" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
-        d="M1.75 8h3.5c2 0 2.5-4.25 4.75-4.25h2M5.25 8c2 0 2.5 4.25 4.75 4.25h2M10.75 1.75l2 2-2 2M10.75 10.25l2 2-2 2"/>
-  <circle cx="1.9" cy="8" r="1.4" fill="#2e3436"/>
+  <!-- Filled shapes only: GTK draws stroked symbolic icons as solid blobs. -->
+  <path fill="#2e3436" d="M2 7.25h3L8.5 3H12v1.5H9.2L5.7 8.75H2z"/>
+  <path fill="#2e3436" d="M2 8.75h3L8.5 13H12v-1.5H9.2L5.7 7.25H2z"/>
+  <path fill="#2e3436" d="M11.5 1.25l3 2.5-3 2.5zM11.5 9.75l3 2.5-3 2.5z"/>
+  <path fill="#2e3436" d="M.5 8a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0z"/>
 </svg>

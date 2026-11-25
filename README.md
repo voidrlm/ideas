@@ -94,6 +94,9 @@ and the to-do is ticked off when it finishes its reply. To pick the OpenRouter m
 `IDEAS_OPENROUTER_MODEL`, for example `export IDEAS_OPENROUTER_MODEL=openai/gpt-5` in `~/.profile`;
 otherwise OpenRouter's default for Claude Code is used. Your OpenRouter key is read in the terminal and never put on a command line.
 
+To just open an agent in the folder, with nothing to do yet, use the icons at the left of the header bar.
+[OpenCode](https://opencode.ai) gets one there too when the `opencode` command is installed.
+
 Use the list menu to send all open to-dos at once. If you close Claude Code before it finishes, the
 to-do simply stays open. Sessions that finish while Ideas is closed are picked up the next time it opens.
 

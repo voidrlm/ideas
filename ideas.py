@@ -74,6 +74,7 @@ def build_css():
     .agent-btn { min-width: 34px; min-height: 34px; padding: 0; }
     .agent-btn.sent { background-color: transparent; color: inherit; opacity: 0.55; }
     .agent-btn.sent:hover { background-color: alpha(currentColor, 0.1); opacity: 1; }
+    .launch-box { margin: 0 2px; }
     .git-btn { min-width: 26px; min-height: 26px; padding: 0; margin: -4px 0; color: var(--accent-color); }
     .git-files { font-family: monospace; font-size: 0.9em; }
     """
@@ -85,6 +86,9 @@ def build_css():
         .agent-{key}:active {{ background-color: alpha({c}, 0.36); }}
         .working-{key} {{ color: {c}; }}
         """
+    for key, agent in LAUNCHERS.items():
+        if agent.get("color"):
+            css += f".launch-{key} {{ color: {agent['color']}; }}\n"
     for name, hexc in core.COLORS:
         css += f"""
         .dot.{name}, .color-choice.{name} {{ background-color: {hexc}; }}
@@ -118,6 +122,15 @@ AGENTS = {
 }
 OPENROUTER_URL = "https://openrouter.ai/api"
 
+# What the header buttons can open in a list's folder: the agents above, plus ones that to-dos
+# can't be sent to (yet).  In the order the buttons are shown.
+LAUNCHERS = {
+    "claude": AGENTS["claude"],
+    "opencode": {"name": "OpenCode", "icon": "opencode-symbolic", "color": None},
+    "codex": AGENTS["codex"],
+    "openrouter": AGENTS["openrouter"],
+}
+
 
 def find_program(name, extra=()):
     """A program on PATH or in the usual per-user install places (apps started from the desktop
@@ -137,6 +150,19 @@ def find_claude():
 
 def find_codex():
     return find_program("codex")
+
+
+def find_opencode():
+    return find_program("opencode", [os.path.expanduser("~/.opencode/bin/opencode")])
+
+
+def detect_launchers(agents):
+    """{launcher: program path} for what can be opened in a folder.  agents: detect_agents()."""
+    found = dict(agents)
+    opencode = find_opencode()
+    if opencode:
+        found["opencode"] = opencode
+    return {key: found[key] for key in LAUNCHERS if key in found}
 
 
 def login_shell_facts():
@@ -204,7 +230,10 @@ def agent_argv(agent, program, prompt, extra_dirs=(), images=(), marker=None):
     """The command line that starts `agent` on `prompt`.
 
     marker: path prefix; "<marker>.done" is touched when the agent finishes its turn.
+    prompt None: just open the agent, with nothing to do yet.
     """
+    if prompt is None:
+        return [program]
     done = marker + ".done" if marker else None
     if agent == "codex":
         argv = [program]
@@ -223,19 +252,20 @@ def agent_argv(agent, program, prompt, extra_dirs=(), images=(), marker=None):
 
 
 def launch_agent(agent, folder, prompt, extra_dirs=(), images=(), marker=None, agents=None):
-    """Open a terminal in `folder` running `agent` with `prompt`.  Returns an error or None.
+    """Open a terminal in `folder` running `agent` with `prompt` (None: just open it).  Returns an error or None.
 
     extra_dirs (where attached images live) let the agent read them; images are also attached
     directly where the agent supports it.  marker: path prefix; "<marker>.done" is touched when the
     agent finishes its turn and "<marker>.exit" when the command ends, so the app can tell how it went.
     """
-    name = AGENTS[agent]["name"]
+    name = LAUNCHERS[agent]["name"]
     if not folder or not os.path.isdir(folder):
         return "The linked folder doesn't exist any more"
-    program = (agents if agents is not None else detect_agents()).get(agent)
+    program = (agents if agents is not None else detect_launchers(detect_agents())).get(agent)
     if not program:
         return {"claude": "Claude Code (the “claude” command) isn't installed",
                 "codex": "Codex (the “codex” command) isn't installed",
+                "opencode": "OpenCode (the “opencode” command) isn't installed",
                 "openrouter": "OpenRouter needs Claude Code and OPENROUTER_API_KEY"}[agent]
     term = next(((shutil.which(t), args) for t, args in TERMINALS if shutil.which(t)), None)
     if not term:
@@ -495,6 +525,7 @@ class IdeasApp(Adw.Application):
         migrate_old_data()
         self.store = core.Store(DATA_FILE)
         self.agents = detect_agents()       # {agent: program}; refined by a login shell below
+        self.launchers = detect_launchers(self.agents)      # what the header buttons can open
         in_background(login_shell_facts, self._got_shell_facts)
         self._watch_claude_runs()
         try:
@@ -539,6 +570,7 @@ class IdeasApp(Adw.Application):
         agents = detect_agents(facts if isinstance(facts, dict) else None)
         if agents != self.agents:
             self.agents = agents
+            self.launchers = detect_launchers(agents)
             if self.window in self.get_windows():
                 self.window.refresh()
 
@@ -702,6 +734,7 @@ class MainWindow(Adw.ApplicationWindow):
         # target "<agent>:<id>"
         add("item-agent", lambda a, v: self._send_target(v.get_string(), whole_list=False), "s")
         add("list-agent", lambda a, v: self._send_target(v.get_string(), whole_list=True), "s")
+        add("open-agent", lambda a, v: self.open_agent(v.get_string()), "s")
         add("list-push", lambda a, v: self.push_list(v.get_string()), "s")
         add("teams-check", lambda *a: self.check_source("teams"), accels=["<Control>t"])
         add("teams-login", lambda *a: self.check_source("teams", login=True))
@@ -861,6 +894,9 @@ class MainWindow(Adw.ApplicationWindow):
         hb.pack_end(self.search_btn)
         self.view_menu_btn = Gtk.MenuButton(icon_name="view-more-symbolic", tooltip_text="List Options")
         hb.pack_end(self.view_menu_btn)
+        self.launch_box = Gtk.Box(css_classes=["launch-box"], visible=False)   # filled by _render_launchers
+        self._launch_shown = None
+        hb.pack_start(self.launch_box)
         self.window_title = Adw.WindowTitle()
         hb.set_title_widget(self.window_title)
         tv.add_top_bar(hb)
@@ -1027,6 +1063,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.window_title.set_title(title)
         self.window_title.set_subtitle(core.short_path(lst["folder"]) if lst.get("folder") and not search else "")
         self.quick_box.set_visible(not search)
+        self._render_launchers(None if search else lst.get("folder"))
 
         menu = Gio.Menu()
         menu.append("Show Completed", "win.show-completed")
@@ -1383,6 +1420,40 @@ class MainWindow(Adw.ApplicationWindow):
             self.search_bar.set_search_mode(False)
         self.refresh(scroll_top=True)
         self.toast(f"Added {plural(len(added), 'to-do')} from {label}", lambda: self.store.delete_items(ids))
+
+    def _render_launchers(self, folder):
+        """The header buttons that open a coding agent in the list's folder."""
+        shown = (folder, tuple(self.app.launchers)) if folder else None
+        if shown == self._launch_shown:
+            return
+        self._launch_shown = shown
+        while (child := self.launch_box.get_first_child()):
+            self.launch_box.remove(child)
+        self.launch_box.set_visible(bool(shown and self.app.launchers))
+        if not shown:
+            return
+        where = core.short_path(folder)
+        for key in self.app.launchers:
+            btn = Gtk.Button(icon_name=LAUNCHERS[key]["icon"], css_classes=["flat", f"launch-{key}"],
+                             tooltip_text=f"Open {LAUNCHERS[key]['name']} in {where}")
+            btn.set_action_name("win.open-agent")
+            btn.set_action_target_value(GLib.Variant("s", key))
+            self.launch_box.append(btn)
+
+    def open_agent(self, agent):
+        """Open a coding agent in the current list's folder, with nothing to do yet."""
+        lst = self.store.get_list(self.list_id)
+        if agent not in LAUNCHERS or not lst:
+            return
+        if not lst.get("folder"):
+            self.toast("Link a folder to this list first (Edit List…)")
+            return
+        try:
+            err = launch_agent(agent, lst["folder"], None, agents=self.app.launchers)
+        except Exception as e:      # never fail silently: say what went wrong
+            err = f"Couldn't start {LAUNCHERS[agent]['name']}: {e}"
+        if err:
+            self.toast(err)
 
     def send_to_agent(self, item_ids, list_id=None, agent="claude"):
         items = [it for it in (self.store.get_item(i) for i in item_ids) if it]
