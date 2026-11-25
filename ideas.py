@@ -63,14 +63,13 @@ def build_css():
     .thumb-more { font-size: 0.8em; font-weight: bold; }
     .image-remove { min-width: 24px; min-height: 24px; padding: 0; margin: 4px; }
     .image-tile { padding: 0; border-radius: 10px; }
-    .claude-btn { border-radius: 99px; padding: 2px 12px; font-weight: 600;
-                  background-color: alpha(#d97757, 0.16);
-                  color: color-mix(in srgb, #d97757 70%, var(--window-fg-color)); }
-    .claude-btn:hover { background-color: alpha(#d97757, 0.28); }
-    .claude-btn:active { background-color: alpha(#d97757, 0.38); }
-    .claude-btn.sent { background-color: alpha(currentColor, 0.08); color: inherit; font-weight: normal; opacity: 0.75; }
+    .claude-btn { min-width: 34px; min-height: 34px; padding: 0; color: #d97757;
+                  background-color: alpha(#d97757, 0.14); }
+    .claude-btn:hover { background-color: alpha(#d97757, 0.26); }
+    .claude-btn:active { background-color: alpha(#d97757, 0.36); }
+    .claude-btn.sent { background-color: transparent; color: inherit; opacity: 0.55; }
+    .claude-btn.sent:hover { background-color: alpha(currentColor, 0.1); opacity: 1; }
     .claude-working { color: #d97757; }
-    .claude-btn.sent:hover { background-color: alpha(currentColor, 0.14); opacity: 1; }
     .git-btn { min-width: 26px; min-height: 26px; padding: 0; margin: -4px 0; color: var(--accent-color); }
     .git-files { font-family: monospace; font-size: 0.9em; }
     """
@@ -387,6 +386,8 @@ class IdeasApp(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         GLib.set_application_name(APP_NAME)
+        Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(
+            os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "icons"))   # claude-symbolic
         provider = Gtk.CssProvider()
         provider.load_from_string(build_css())
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
@@ -957,14 +958,12 @@ class MainWindow(Adw.ApplicationWindow):
         if it.get("claude_run") and not it["done"]:
             sent = Gtk.Box(spacing=4, css_classes=["claude-working"],
                            tooltip_text="Claude Code is working on this; it's marked done when Claude finishes")
+            sent.append(Gtk.Image(icon_name="claude-symbolic", pixel_size=12))
             sent.append(Adw.Spinner(width_request=12, height_request=12))
-            sent.append(Gtk.Label(label="Claude is working…"))
             meta.append(sent)
         elif it.get("claude_sent_at"):
-            sent = Gtk.Box(spacing=4, css_classes=["dim-label"])
-            sent.append(Gtk.Image(icon_name="utilities-terminal-symbolic", pixel_size=12))
-            sent.append(Gtk.Label(label="Sent to Claude"))
-            meta.append(sent)
+            meta.append(Gtk.Image(icon_name="claude-symbolic", pixel_size=12, css_classes=["dim-label"],
+                                  tooltip_text="Sent to Claude Code"))
         if show_list:
             lb = Gtk.Box(spacing=5)
             lb.append(color_dot(lst["color"], 8))
@@ -986,11 +985,13 @@ class MainWindow(Adw.ApplicationWindow):
             box.append(tb)
         if lst.get("folder") and not it["done"]:
             sent = bool(it.get("claude_sent_at"))
-            send = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["claude-btn"] + (["sent"] if sent else []),
-                              tooltip_text=f"Open Claude Code in {core.short_path(lst['folder'])} with this to-do"
-                                           + (" and its images" if it["images"] else ""))
-            send.set_child(Adw.ButtonContent(icon_name="mail-send-symbolic",
-                                             label="Send Again" if sent else "Send to Claude"))
+            send = Gtk.Button(icon_name="claude-symbolic", valign=Gtk.Align.CENTER,
+                              css_classes=["circular", "claude-btn"] + (["sent"] if sent else []),
+                              tooltip_text=("Send to Claude Code again" if sent else "Send to Claude Code")
+                                           + f" — opens in {core.short_path(lst['folder'])}"
+                                           + (" with its images" if it["images"] else ""))
+            send.update_property([Gtk.AccessibleProperty.LABEL],
+                                 ["Send to Claude Code again" if sent else "Send to Claude Code"])
             send.set_action_name("win.item-claude")
             send.set_action_target_value(GLib.Variant("s", it["id"]))
             box.append(send)
@@ -1437,7 +1438,7 @@ class ItemDialog(Adw.Dialog):
         page.add(go)
 
         self.claude_group = Adw.PreferencesGroup()
-        claude_row = Adw.ButtonRow(title="Send to Claude Code", start_icon_name="utilities-terminal-symbolic")
+        claude_row = Adw.ButtonRow(title="Send to Claude Code", start_icon_name="claude-symbolic")
         claude_row.connect("activated", self._on_claude)
         self.claude_group.add(claude_row)
         page.add(self.claude_group)
