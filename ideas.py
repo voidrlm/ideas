@@ -58,6 +58,13 @@ def build_css():
     .thumb-more { font-size: 0.8em; font-weight: bold; }
     .image-remove { min-width: 24px; min-height: 24px; padding: 0; margin: 4px; }
     .image-tile { padding: 0; border-radius: 10px; }
+    .claude-btn { border-radius: 99px; padding: 2px 12px; font-weight: 600;
+                  background-color: alpha(#d97757, 0.16);
+                  color: color-mix(in srgb, #d97757 70%, var(--window-fg-color)); }
+    .claude-btn:hover { background-color: alpha(#d97757, 0.28); }
+    .claude-btn:active { background-color: alpha(#d97757, 0.38); }
+    .claude-btn.sent { background-color: alpha(currentColor, 0.08); color: inherit; font-weight: normal; opacity: 0.75; }
+    .claude-btn.sent:hover { background-color: alpha(currentColor, 0.14); opacity: 1; }
     """
     for name, hexc in core.COLORS:
         css += f"""
@@ -69,9 +76,15 @@ def build_css():
 
 
 def spawn(argv, cwd=None):
-    """Start a program without waiting for it; GLib reaps it when it exits."""
-    GLib.spawn_async(argv, working_directory=cwd,
-                     flags=GLib.SpawnFlags.STDOUT_TO_DEV_NULL | GLib.SpawnFlags.STDERR_TO_DEV_NULL)
+    """Start a program without waiting for it.  Raises GLib.Error if it can't start.
+
+    (GLib.spawn_async's Python override is broken in this PyGObject, so use Gio.Subprocess.)
+    """
+    launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+    if cwd:
+        launcher.set_cwd(cwd)
+    proc = launcher.spawnv(argv)
+    proc.wait_async(None, lambda p, res: p.wait_finish(res))   # reap it when it exits
 
 
 # ---------------------------------------------------------------- Claude Code
@@ -811,9 +824,12 @@ class MainWindow(Adw.ApplicationWindow):
                 tb.append(Gtk.Label(label=f"+{len(it['images']) - 1}", css_classes=["thumb-more", "dim-label"]))
             box.append(tb)
         if lst.get("folder") and not it["done"]:
-            send = Gtk.Button(icon_name="utilities-terminal-symbolic", valign=Gtk.Align.CENTER,
-                              css_classes=["flat", "circular"],
-                              tooltip_text=f"Send to Claude Code in {core.short_path(lst['folder'])}")
+            sent = bool(it.get("claude_sent_at"))
+            send = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["claude-btn"] + (["sent"] if sent else []),
+                              tooltip_text=f"Open Claude Code in {core.short_path(lst['folder'])} with this to-do"
+                                           + (" and its images" if it["images"] else ""))
+            send.set_child(Adw.ButtonContent(icon_name="mail-send-symbolic",
+                                             label="Send Again" if sent else "Send to Claude"))
             send.set_action_name("win.item-claude")
             send.set_action_target_value(GLib.Variant("s", it["id"]))
             box.append(send)
@@ -884,8 +900,11 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast("Link a folder to this list first (Edit List…)")
             return
         has_images = any(it["images"] for it in items)
-        err = launch_claude(lst["folder"], core.claude_prompt(items, lst["name"], self.store.image_path),
-                            [self.store.images_dir] if has_images else ())
+        try:
+            err = launch_claude(lst["folder"], core.claude_prompt(items, lst["name"], self.store.image_path),
+                                [self.store.images_dir] if has_images else ())
+        except Exception as e:      # never fail silently: say what went wrong
+            err = f"Couldn't start Claude Code: {e}"
         if err:
             self.toast(err)
             return
