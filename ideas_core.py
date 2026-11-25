@@ -35,6 +35,7 @@ ITEM_DEFAULTS = {
     "created": None,
     "claude_sent_at": None,   # last time it was sent to Claude Code
     "claude_run": None,       # id of the Claude Code session working on it; cleared when that finishes
+    "agent": None,            # which coding agent it was last sent to ("claude", "codex", "openrouter")
     "images": (),             # file names in Store.images_dir (always replaced, never mutated)
     "teams_id": None,         # "<message id>@<chat id>" of the Teams message it came from
     "teams_url": None,        # link that opens that message in Teams
@@ -285,13 +286,16 @@ class Store:
     def claude_runs_dir(self):
         return os.path.join(os.path.dirname(self.path), "claude-runs")
 
-    def start_claude_run(self, item_ids, run):
-        """Mark items as being worked on by Claude Code session `run` (replacing any earlier one)."""
+    def start_claude_run(self, item_ids, run, agent="claude"):
+        """Mark items as being worked on by agent session `run` (replacing any earlier one).
+
+        (Named for Claude Code, the first agent; Codex and OpenRouter sessions work the same way.)
+        """
         stamp = now_str()
         for iid in item_ids:
             it = self.get_item(iid)
             if it:
-                it["claude_sent_at"], it["claude_run"] = stamp, run
+                it["claude_sent_at"], it["claude_run"], it["agent"] = stamp, run, agent
         self.changed()
 
     def finish_claude_runs(self):

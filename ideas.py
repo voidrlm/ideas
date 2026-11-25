@@ -5,6 +5,7 @@ to-dos (with their images) can then be sent to Claude Code in that folder.
 Everything lives in one JSON file (~/.local/share/ideas/data.json).
 """
 
+import glob
 import json
 import os
 import shlex
@@ -70,16 +71,20 @@ def build_css():
     .thumb-more { font-size: 0.8em; font-weight: bold; }
     .image-remove { min-width: 24px; min-height: 24px; padding: 0; margin: 4px; }
     .image-tile { padding: 0; border-radius: 10px; }
-    .claude-btn { min-width: 34px; min-height: 34px; padding: 0; color: #d97757;
-                  background-color: alpha(#d97757, 0.14); }
-    .claude-btn:hover { background-color: alpha(#d97757, 0.26); }
-    .claude-btn:active { background-color: alpha(#d97757, 0.36); }
-    .claude-btn.sent { background-color: transparent; color: inherit; opacity: 0.55; }
-    .claude-btn.sent:hover { background-color: alpha(currentColor, 0.1); opacity: 1; }
-    .claude-working { color: #d97757; }
+    .agent-btn { min-width: 34px; min-height: 34px; padding: 0; }
+    .agent-btn.sent { background-color: transparent; color: inherit; opacity: 0.55; }
+    .agent-btn.sent:hover { background-color: alpha(currentColor, 0.1); opacity: 1; }
     .git-btn { min-width: 26px; min-height: 26px; padding: 0; margin: -4px 0; color: var(--accent-color); }
     .git-files { font-family: monospace; font-size: 0.9em; }
     """
+    for key, agent in AGENTS.items():
+        c = agent["color"]
+        css += f"""
+        .agent-{key} {{ color: {c}; background-color: alpha({c}, 0.14); }}
+        .agent-{key}:hover {{ background-color: alpha({c}, 0.26); }}
+        .agent-{key}:active {{ background-color: alpha({c}, 0.36); }}
+        .working-{key} {{ color: {c}; }}
+        """
     for name, hexc in core.COLORS:
         css += f"""
         .dot.{name}, .color-choice.{name} {{ background-color: {hexc}; }}
@@ -104,12 +109,63 @@ def spawn(argv, cwd=None):
 # ---------------------------------------------------------------- Claude Code
 
 
+# The coding agents a to-do can be sent to.  Each runs in a terminal in the list's folder.
+AGENTS = {
+    "claude": {"name": "Claude Code", "icon": "claude-symbolic", "color": "#d97757"},
+    "codex": {"name": "Codex", "icon": "codex-symbolic", "color": "#10a37f"},
+    # Claude Code, with OpenRouter as the model provider (any OpenRouter model: IDEAS_OPENROUTER_MODEL)
+    "openrouter": {"name": "OpenRouter", "icon": "openrouter-symbolic", "color": "#6467f2"},
+}
+OPENROUTER_URL = "https://openrouter.ai/api"
+
+
+def find_program(name, extra=()):
+    """A program on PATH or in the usual per-user install places (apps started from the desktop
+    often don't have ~/.local/bin and friends on PATH)."""
+    home = os.path.expanduser("~")
+    places = [shutil.which(name), *extra,
+              *(os.path.join(home, d, name) for d in (".local/bin", ".npm-global/bin", ".bun/bin", ".volta/bin",
+                                                      ".cargo/bin", "bin")),
+              *sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/bin", name)), reverse=True),
+              os.path.join("/usr/local/bin", name)]
+    return next((p for p in places if p and os.access(p, os.X_OK)), None)
+
+
 def find_claude():
-    for p in (shutil.which("claude"), os.path.expanduser("~/.local/bin/claude"),
-              os.path.expanduser("~/.claude/local/claude")):
-        if p and os.access(p, os.X_OK):
-            return p
-    return None
+    return find_program("claude", [os.path.expanduser("~/.claude/local/claude")])
+
+
+def find_codex():
+    return find_program("codex")
+
+
+def login_shell_facts():
+    """What a login shell knows that the desktop may not: where codex is, and whether an
+    OpenRouter key is set (only whether: the key itself isn't read here).  Slow-ish: run it in the background."""
+    try:
+        import subprocess
+        r = subprocess.run(["bash", "-lc", 'command -v codex; echo "--"; [ -n "$OPENROUTER_API_KEY" ] && echo key'],
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+        before, _, after = r.stdout.partition("--")
+        codex = before.strip().splitlines()[-1] if before.strip() else None
+        return {"codex": codex if codex and os.access(codex, os.X_OK) else None, "openrouter_key": "key" in after}
+    except Exception:
+        return {"codex": None, "openrouter_key": False}
+
+
+def detect_agents(shell=None):
+    """{agent: program path} for the agents that can be used.  shell: login_shell_facts(), if known."""
+    shell = shell or {}
+    found = {}
+    claude = find_claude()
+    if claude:
+        found["claude"] = claude
+    codex = find_codex() or shell.get("codex")
+    if codex:
+        found["codex"] = codex
+    if claude and (os.environ.get("OPENROUTER_API_KEY") or shell.get("openrouter_key")):
+        found["openrouter"] = claude
+    return found
 
 
 # How to run a command in a new window, per terminal.  The command itself cds into the
@@ -127,40 +183,71 @@ TERMINALS = [
     ("xdg-terminal-exec", []),
 ]
 
+# Runs in the terminal: cd into the folder, set up OpenRouter if asked, run the agent, note when it
+# exits (also if the window is closed), then stay in a shell in that folder instead of closing.
+# The OpenRouter key is taken from the environment here, so it never appears on a command line.
+TERMINAL_SCRIPT = (
+    'cd "$1" || exit 1; m="$2"; mode="$3"; shift 3; '
+    'if [ "$mode" = openrouter ]; then '
+    '  if [ -z "$OPENROUTER_API_KEY" ]; then echo "OPENROUTER_API_KEY is not set in this shell."; '
+    '  else export ANTHROPIC_BASE_URL=' + OPENROUTER_URL + ' ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" ANTHROPIC_API_KEY=""; '
+    '    [ -n "$IDEAS_OPENROUTER_MODEL" ] && export ANTHROPIC_MODEL="$IDEAS_OPENROUTER_MODEL" '
+    'ANTHROPIC_DEFAULT_SONNET_MODEL="$IDEAS_OPENROUTER_MODEL" ANTHROPIC_DEFAULT_OPUS_MODEL="$IDEAS_OPENROUTER_MODEL" '
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL="$IDEAS_OPENROUTER_MODEL" ANTHROPIC_SMALL_FAST_MODEL="$IDEAS_OPENROUTER_MODEL"; fi; '
+    'fi; '
+    'trap \'[ -n "$m" ] && touch "$m"; exit 129\' HUP TERM; '
+    '"$@"; [ -n "$m" ] && touch "$m"; trap - HUP TERM; exec "${SHELL:-bash}" -l'
+)
 
-def launch_claude(folder, prompt, extra_dirs=(), marker=None):
-    """Open a terminal in `folder` running Claude Code with `prompt`.  Returns an error or None.
 
-    extra_dirs (where attached images live) are passed with --add-dir so Claude can read them.
-    marker: path prefix; "<marker>.done" is touched when Claude finishes its turn (a Stop hook)
-    and "<marker>.exit" when the claude command ends, so the app can tell how it went.
+def agent_argv(agent, program, prompt, extra_dirs=(), images=(), marker=None):
+    """The command line that starts `agent` on `prompt`.
+
+    marker: path prefix; "<marker>.done" is touched when the agent finishes its turn.
     """
-    if not folder or not os.path.isdir(folder):
-        return "The linked folder doesn't exist any more"
-    claude = find_claude()
-    if not claude:
-        return "Claude Code (the “claude” command) isn't installed"
-    term = next(((shutil.which(t), args) for t, args in TERMINALS if shutil.which(t)), None)
-    if not term:
-        return "No terminal app found"
-    argv = [claude]
-    if marker:
-        hook = {"type": "command", "command": "touch " + shlex.quote(marker + ".done")}
+    done = marker + ".done" if marker else None
+    if agent == "codex":
+        argv = [program]
+        if done:    # Codex runs `notify` after each turn, with a JSON description as the last argument
+            argv += ["-c", "notify=" + json.dumps(["bash", "-c", 'touch "$0"', done])]
+        if images:
+            argv += ["--image", ",".join(images)]
+        return argv + ["--", prompt]
+    argv = [program]        # Claude Code (directly, or through OpenRouter)
+    if done:
+        hook = {"type": "command", "command": "touch " + shlex.quote(done)}
         argv += ["--settings", json.dumps({"hooks": {"Stop": [{"hooks": [hook]}]}})]
     for d in extra_dirs:
         argv += ["--add-dir", d]
-    argv += ["--", prompt]      # "--" ends options: --add-dir takes several values, and prompts may start with "-"
-    # Note when Claude exits (also if the window is closed), then stay in a shell in that
-    # folder instead of closing the window.
-    script = ('cd "$1" || exit 1; m="$2"; shift 2; '
-              'trap \'[ -n "$m" ] && touch "$m"; exit 129\' HUP TERM; '
-              '"$@"; [ -n "$m" ] && touch "$m"; trap - HUP TERM; exec "${SHELL:-bash}" -l')
+    return argv + ["--", prompt]      # "--" ends options: --add-dir takes several values, and prompts may start with "-"
+
+
+def launch_agent(agent, folder, prompt, extra_dirs=(), images=(), marker=None, agents=None):
+    """Open a terminal in `folder` running `agent` with `prompt`.  Returns an error or None.
+
+    extra_dirs (where attached images live) let the agent read them; images are also attached
+    directly where the agent supports it.  marker: path prefix; "<marker>.done" is touched when the
+    agent finishes its turn and "<marker>.exit" when the command ends, so the app can tell how it went.
+    """
+    name = AGENTS[agent]["name"]
+    if not folder or not os.path.isdir(folder):
+        return "The linked folder doesn't exist any more"
+    program = (agents if agents is not None else detect_agents()).get(agent)
+    if not program:
+        return {"claude": "Claude Code (the “claude” command) isn't installed",
+                "codex": "Codex (the “codex” command) isn't installed",
+                "openrouter": "OpenRouter needs Claude Code and OPENROUTER_API_KEY"}[agent]
+    term = next(((shutil.which(t), args) for t, args in TERMINALS if shutil.which(t)), None)
+    if not term:
+        return "No terminal app found"
+    argv = agent_argv(agent, program, prompt, extra_dirs, images, marker)
     exit_marker = marker + ".exit" if marker else ""
-    cmd = [term[0], *term[1], "bash", "-lc", script, "claude-code", folder, exit_marker, *argv]
+    mode = "openrouter" if agent == "openrouter" else "-"
+    cmd = [term[0], *term[1], "bash", "-lc", TERMINAL_SCRIPT, f"ideas-{agent}", folder, exit_marker, mode, *argv]
     try:
         spawn(cmd, cwd=folder)
     except GLib.Error as e:
-        return f"Couldn't open the terminal: {e.message}"
+        return f"Couldn't open the terminal for {name}: {e.message}"
     return None
 
 
@@ -371,6 +458,11 @@ def join_names(names):
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def agent_name(item):
+    """Name of the agent a to-do was last sent to."""
+    return AGENTS.get(item.get("agent") or "claude", AGENTS["claude"])["name"]
+
+
 def in_background(work, done):
     """Run work() off the main thread, then done(result) back on it."""
     def run():
@@ -395,13 +487,15 @@ class IdeasApp(Adw.Application):
         Adw.Application.do_startup(self)
         GLib.set_application_name(APP_NAME)
         Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(
-            os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "icons"))   # claude-symbolic
+            os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "icons"))   # agent icons
         provider = Gtk.CssProvider()
         provider.load_from_string(build_css())
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         migrate_old_data()
         self.store = core.Store(DATA_FILE)
+        self.agents = detect_agents()       # {agent: program}; refined by a login shell below
+        in_background(login_shell_facts, self._got_shell_facts)
         self._watch_claude_runs()
         try:
             os.remove(OLD_AUTOSTART_FILE)
@@ -441,7 +535,14 @@ class IdeasApp(Adw.Application):
         self.window.present()
         self.check_claude_runs()        # sessions that finished while Ideas was closed
 
-    # -- Claude Code sessions finishing
+    def _got_shell_facts(self, facts):
+        agents = detect_agents(facts if isinstance(facts, dict) else None)
+        if agents != self.agents:
+            self.agents = agents
+            if self.window in self.get_windows():
+                self.window.refresh()
+
+    # -- agent sessions finishing
 
     def _watch_claude_runs(self):
         self._runs_check_queued = False
@@ -466,10 +567,10 @@ class IdeasApp(Adw.Application):
                 for iid in ids:
                     self.store.set_done(iid, False)
             what = f"“{finished[0]['title']}”" if len(finished) == 1 else plural(len(finished), "to-do")
-            win.toast(f"Claude Code finished {what}: marked done", undo)
+            win.toast(f"{agent_name(finished[0])} finished {what}: marked done", undo)
         if win and abandoned:
             what = f"“{abandoned[0]['title']}”" if len(abandoned) == 1 else plural(len(abandoned), "to-do")
-            win.toast(f"Claude Code closed before finishing {what}, so it's still open")
+            win.toast(f"{agent_name(abandoned[0])} closed before finishing {what}, so it's still open")
         return False
 
     def window_closed(self, win):
@@ -598,8 +699,9 @@ class MainWindow(Adw.ApplicationWindow):
         add("clear-completed", lambda *a: self.clear_completed())
         add("item-open", lambda a, v: self.open_item(v.get_string()), "s")
         add("item-delete", lambda a, v: self.delete_item(v.get_string()), "s")
-        add("item-claude", lambda a, v: self.send_to_claude([v.get_string()]), "s")
-        add("list-claude", lambda a, v: self.send_list_to_claude(v.get_string()), "s")
+        # target "<agent>:<id>"
+        add("item-agent", lambda a, v: self._send_target(v.get_string(), whole_list=False), "s")
+        add("list-agent", lambda a, v: self._send_target(v.get_string(), whole_list=True), "s")
         add("list-push", lambda a, v: self.push_list(v.get_string()), "s")
         add("teams-check", lambda *a: self.check_source("teams"), accels=["<Control>t"])
         add("teams-login", lambda *a: self.check_source("teams", login=True))
@@ -611,6 +713,16 @@ class MainWindow(Adw.ApplicationWindow):
         show.connect("change-state", self._on_show_completed)
         self.add_action(show)
         self.app.set_accels_for_action("win.show-completed", ["<Control>h"])
+
+    def _send_target(self, target, whole_list):
+        """An item-agent / list-agent action's target is "<agent>:<item or list id>"."""
+        agent, _, oid = target.partition(":")
+        if agent not in AGENTS or not oid:
+            return
+        if whole_list:
+            self.send_list_to_agent(oid, agent)
+        else:
+            self.send_to_agent([oid], agent=agent)
 
     def _on_show_completed(self, action, value):
         action.set_state(value)
@@ -725,7 +837,8 @@ class MainWindow(Adw.ApplicationWindow):
         lst = self.store.get_list(list_id)
         if lst and lst.get("folder"):
             cc = Gio.Menu()
-            cc.append("Send Open To-dos to Claude Code", f"win.list-claude::{list_id}")
+            for key in self.app.agents:
+                cc.append(f"Send Open To-dos to {AGENTS[key]['name']}", f"win.list-agent::{key}:{list_id}")
             if self.git_state.get(list_id) and list_id not in self.git_busy:
                 cc.append("Commit and Push Changes…", f"win.list-push::{list_id}")
             menu.append_section(None, cc)
@@ -973,15 +1086,16 @@ class MainWindow(Adw.ApplicationWindow):
         text.append(title_box)
 
         meta = Gtk.Box(spacing=8, css_classes=["item-meta"])
+        agent = it.get("agent") if it.get("agent") in AGENTS else "claude"
         if it.get("claude_run") and not it["done"]:
-            sent = Gtk.Box(spacing=4, css_classes=["claude-working"],
-                           tooltip_text="Claude Code is working on this; it's marked done when Claude finishes")
-            sent.append(Gtk.Image(icon_name="claude-symbolic", pixel_size=12))
+            sent = Gtk.Box(spacing=4, css_classes=[f"working-{agent}"],
+                           tooltip_text=f"{AGENTS[agent]['name']} is working on this; it's marked done when it finishes")
+            sent.append(Gtk.Image(icon_name=AGENTS[agent]["icon"], pixel_size=12))
             sent.append(Adw.Spinner(width_request=12, height_request=12))
             meta.append(sent)
         elif it.get("claude_sent_at"):
-            meta.append(Gtk.Image(icon_name="claude-symbolic", pixel_size=12, css_classes=["dim-label"],
-                                  tooltip_text="Sent to Claude Code"))
+            meta.append(Gtk.Image(icon_name=AGENTS[agent]["icon"], pixel_size=12, css_classes=["dim-label"],
+                                  tooltip_text=f"Sent to {AGENTS[agent]['name']}"))
         if show_list:
             lb = Gtk.Box(spacing=5)
             lb.append(color_dot(lst["color"], 8))
@@ -1002,17 +1116,23 @@ class MainWindow(Adw.ApplicationWindow):
                 tb.append(Gtk.Label(label=f"+{len(it['images']) - 1}", css_classes=["thumb-more", "dim-label"]))
             box.append(tb)
         if lst.get("folder") and not it["done"]:
-            sent = bool(it.get("claude_sent_at"))
-            send = Gtk.Button(icon_name="claude-symbolic", valign=Gtk.Align.CENTER,
-                              css_classes=["circular", "claude-btn"] + (["sent"] if sent else []),
-                              tooltip_text=("Send to Claude Code again" if sent else "Send to Claude Code")
-                                           + f" — opens in {core.short_path(lst['folder'])}"
-                                           + (" with its images" if it["images"] else ""))
-            send.update_property([Gtk.AccessibleProperty.LABEL],
-                                 ["Send to Claude Code again" if sent else "Send to Claude Code"])
-            send.set_action_name("win.item-claude")
-            send.set_action_target_value(GLib.Variant("s", it["id"]))
-            box.append(send)
+            buttons = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+            for key in self.app.agents:
+                name = AGENTS[key]["name"]
+                sent = bool(it.get("claude_sent_at")) and key == agent
+                label = f"Send to {name} again" if sent else f"Send to {name}"
+                if key == "openrouter":
+                    label += " (Claude Code with an OpenRouter model)"
+                send = Gtk.Button(icon_name=AGENTS[key]["icon"], valign=Gtk.Align.CENTER,
+                                  css_classes=["circular", "agent-btn"] + (["sent"] if sent else [f"agent-{key}"]),
+                                  tooltip_text=label + f" — opens in {core.short_path(lst['folder'])}"
+                                               + (" with its images" if it["images"] else ""))
+                send.update_property([Gtk.AccessibleProperty.LABEL], [label])
+                send.set_action_name("win.item-agent")
+                send.set_action_target_value(GLib.Variant("s", f"{key}:{it['id']}"))
+                buttons.append(send)
+            if buttons.get_first_child():
+                box.append(buttons)
         row.set_child(box)
 
         right = Gtk.GestureClick(button=3)
@@ -1033,7 +1153,8 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Edit Details…", f"win.item-open::{iid}")
         lst = self.store.get_list(it["list_id"])
         if lst and lst.get("folder"):
-            menu.append("Send to Claude Code", f"win.item-claude::{iid}")
+            for key in self.app.agents:
+                menu.append(f"Send to {AGENTS[key]['name']}", f"win.item-agent::{key}:{iid}")
         d = Gio.Menu()
         d.append("Delete", f"win.item-delete::{iid}")
         menu.append_section(None, d)
@@ -1263,38 +1384,39 @@ class MainWindow(Adw.ApplicationWindow):
         self.refresh(scroll_top=True)
         self.toast(f"Added {plural(len(added), 'to-do')} from {label}", lambda: self.store.delete_items(ids))
 
-    def send_to_claude(self, item_ids, list_id=None):
+    def send_to_agent(self, item_ids, list_id=None, agent="claude"):
         items = [it for it in (self.store.get_item(i) for i in item_ids) if it]
         if not items:
             return
+        name = AGENTS[agent]["name"]
         lst = self.store.get_list(list_id or items[0]["list_id"])
         if not lst or not lst.get("folder"):
             self.toast("Link a folder to this list first (Edit List…)")
             return
-        has_images = any(it["images"] for it in items)
+        images = [self.store.image_path(n) for it in items for n in it["images"]]
         run = core.new_id()
         try:
             os.makedirs(self.store.claude_runs_dir, exist_ok=True)
-            err = launch_claude(lst["folder"], core.claude_prompt(items, lst["name"], self.store.image_path),
-                                [self.store.images_dir] if has_images else (),
-                                marker=os.path.join(self.store.claude_runs_dir, run))
+            err = launch_agent(agent, lst["folder"], core.claude_prompt(items, lst["name"], self.store.image_path),
+                               [self.store.images_dir] if images else (), images,
+                               marker=os.path.join(self.store.claude_runs_dir, run), agents=self.app.agents)
         except Exception as e:      # never fail silently: say what went wrong
-            err = f"Couldn't start Claude Code: {e}"
+            err = f"Couldn't start {name}: {e}"
         if err:
             self.toast(err)
             return
-        # They're marked done when Claude finishes (see Application.check_claude_runs).
-        self.store.start_claude_run([it["id"] for it in items], run)
+        # They're marked done when the agent finishes (see Application.check_claude_runs).
+        self.store.start_claude_run([it["id"] for it in items], run, agent)
         what = f"“{items[0]['title']}”" if len(items) == 1 else plural(len(items), "to-do")
-        self.toast(f"Sent {what} to Claude Code in {os.path.basename(lst['folder'].rstrip(os.sep))}. "
-                   "It's marked done when Claude finishes.")
+        self.toast(f"Sent {what} to {name} in {os.path.basename(lst['folder'].rstrip(os.sep))}. "
+                   "It's marked done when it finishes.")
 
-    def send_list_to_claude(self, list_id):
+    def send_list_to_agent(self, list_id, agent="claude"):
         ids = [it["id"] for _h, its in self.store.sections(list_id) for it in its if not it["done"]]
         if not ids:
             self.toast("No open to-dos in this list")
             return
-        self.send_to_claude(ids, list_id)
+        self.send_to_agent(ids, list_id, agent)
 
     def delete_item(self, item_id):
         it = self.store.get_item(item_id)
@@ -1480,9 +1602,10 @@ class ItemDialog(Adw.Dialog):
         page.add(go)
 
         self.claude_group = Adw.PreferencesGroup()
-        claude_row = Adw.ButtonRow(title="Send to Claude Code", start_icon_name="claude-symbolic")
-        claude_row.connect("activated", self._on_claude)
-        self.claude_group.add(claude_row)
+        for key in win.app.agents:
+            agent_row = Adw.ButtonRow(title=f"Send to {AGENTS[key]['name']}", start_icon_name=AGENTS[key]["icon"])
+            agent_row.connect("activated", self._on_agent, key)
+            self.claude_group.add(agent_row)
         page.add(self.claude_group)
         self.list_row.connect("notify::selected", lambda *_: self._sync_claude())
 
@@ -1567,15 +1690,16 @@ class ItemDialog(Adw.Dialog):
 
     def _sync_claude(self):
         lst = self._selected_list()
-        self.claude_group.set_visible(bool(lst.get("folder")))
+        self.claude_group.set_visible(bool(lst.get("folder")) and bool(self.win.app.agents))
         if lst.get("folder"):
+            names = join_names(AGENTS[k]["name"] for k in self.win.app.agents) if self.win.app.agents else ""
             self.claude_group.set_description(f"Opens a terminal in {core.short_path(lst['folder'])} and runs "
-                                              "Claude Code with this to-do and its images as the prompt. "
-                                              "It's marked done when Claude finishes.")
+                                              f"{names.replace(' and ', ' or ')} with this to-do and its images as "
+                                              "the prompt. It's marked done when it finishes.")
 
-    def _on_claude(self, *_):
-        self.close()        # saves edits first, so Claude gets the latest text
-        self.win.send_to_claude([self.item_id])
+    def _on_agent(self, _row, agent):
+        self.close()        # saves edits first, so the agent gets the latest text
+        self.win.send_to_agent([self.item_id], agent=agent)
 
     # -- save
 
