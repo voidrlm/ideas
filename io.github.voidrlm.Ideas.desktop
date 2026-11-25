@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Ideas
+GenericName=Ideas and To-Dos
+Comment=Lists of ideas and to-dos, with images and a hand-off to Claude Code
+Exec=ideas
+Icon=io.github.voidrlm.Ideas
+Terminal=false
+Categories=Office;ProjectManagement;GTK;
+Keywords=idea;ideas;todo;to-do;task;tasks;checklist;list;notes;note;claude;
+StartupNotify=true
+Actions=new-item;
+
+[Desktop Action new-item]
+Name=New Idea
+Exec=ideas --new

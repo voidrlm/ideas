@@ -1,23 +1,19 @@
-# Reminders
+# Ideas
 
-A to-do list and reminders app for GNOME, built with GTK 4 and libadwaita.
+Simple lists of ideas and to-dos for GNOME, built with GTK 4 and libadwaita — with images and a
+one-click hand-off to Claude Code.
 
-- **Smart lists:** Today, Scheduled, All, Flagged and Completed, plus your own colored lists.
-- **Quick add with natural dates:** type `Call mom tomorrow 6pm`, `Pay rent on 1st dec`,
-  `Gym every monday 7am`, `Take meds in 20 min`, `!!` for priority, `#flag`, `#ListName`.
-  A preview shows what was understood before you press Enter.
-- **Notifications on time**, with *Mark as Done* and *Snooze* buttons. Reminders missed while
-  the computer was off are shown when it starts again.
-- **Repeats:** daily, weekdays, weekly, monthly and yearly. Completing one schedules the next.
-- **Folder-linked lists → Claude Code:** link a project folder to a list (Edit List…). Each
-  to-do then gets a **Send to Claude Code** button that opens a terminal in that folder and
-  runs `claude` with the to-do (title and notes) as the prompt. The list menu can send all
-  open to-dos at once.
-- **Images:** paste screenshots or copied images/files with `Ctrl+V` (into the add box, onto a
-  selected to-do, or in its details), drag and drop them, or add them from a folder. When a to-do
-  is sent to Claude Code its images go too: their paths are in the prompt and the image folder is
-  passed with `--add-dir`, so Claude can open them without asking.
-- Search, notes, undo for deletes and completions, keyboard shortcuts (`Ctrl+?`).
+- **Lists** with colors. Tick to-dos off; show or clear completed ones per list. Search all lists.
+- **Quick add:** type and press Enter. `!`, `!!`, `!!!` set the priority; `#ListName` files it in
+  another list.
+- **Notes and images:** paste screenshots or copied images/files with `Ctrl+V` (into the add box,
+  onto a selected to-do, or in its details), drag and drop them, or add them from a folder.
+- **Folder-linked lists → Claude Code:** link a project folder to a list (Edit List…). Each to-do
+  then gets a **Send to Claude Code** button that opens a terminal in that folder and runs
+  `claude` with the to-do as the prompt. Its images go too: their paths are in the prompt and the
+  image folder is passed with `--add-dir`, so Claude can open them without asking. The list menu
+  can send all open to-dos at once.
+- Undo for deletes and completions, keyboard shortcuts (`Ctrl+?`).
 
 ## Install
 
@@ -29,26 +25,24 @@ sudo dnf install python3-gobject gtk4 libadwaita
 ./install.sh
 ```
 
-This adds `reminders` to `~/.local/bin` and an entry to the app grid.
+This adds `ideas` to `~/.local/bin` and an entry to the app grid.
 
 ## Usage
 
 ```sh
-reminders                                  # open the window
-reminders --add "Pay rent on 1st dec"      # add a reminder without opening the window
-reminders --new                            # open with the add box focused
+ideas                                 # open the window
+ideas --add "Try a dark theme !!"     # add a to-do without opening the window
+ideas --new                           # open with the add box focused
 ```
-
-By default the app keeps running in the background after you close its window, and starts at
-login, so reminders can notify on time. Turn this off in Preferences → *Run in Background*.
-**Quit** from the menu (`Ctrl+Q`) stops reminders until the app is opened again.
 
 The Claude Code option needs the `claude` command and a terminal (Ptyxis, GNOME Terminal,
 Console, kitty, foot, WezTerm, Alacritty, Konsole or xterm).
 
 ## Data
 
-Everything is stored in `~/.local/share/reminders/data.json`, saved after every change.
-Attached images are kept next to it in `~/.local/share/reminders/images/`; images no reminder
-uses any more are removed the next time the app starts.
-Set `REMINDERS_DATA=/path/to/file.json` to use another file.
+Everything is stored in `~/.local/share/ideas/data.json`, saved after every change. Attached
+images are kept next to it in `images/`; images no to-do uses any more are removed the next time
+the app starts. Set `IDEAS_DATA=/path/to/file.json` to use another file.
+
+Data from the app's earlier name, Reminders (`~/.local/share/reminders`), is moved over
+automatically the first time Ideas starts.
