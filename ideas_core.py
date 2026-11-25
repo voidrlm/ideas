@@ -34,10 +34,16 @@ ITEM_DEFAULTS = {
     "completed_at": None,
     "created": None,
     "claude_sent_at": None,   # last time it was sent to Claude Code
+    "claude_run": None,       # id of the Claude Code session working on it; cleared when that finishes
     "images": (),             # file names in Store.images_dir (always replaced, never mutated)
+    "teams_id": None,         # "<message id>@<chat id>" of the Teams message it came from
+    "teams_url": None,        # link that opens that message in Teams
 }
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+TEAMS_LIST = "Teams"          # the list Teams to-dos go to (made when first needed)
+TEAMS_CHATS_KEPT = 300        # chats whose "checked up to here" bookmark is remembered
 
 
 def new_id():
@@ -263,6 +269,59 @@ class Store:
             self.changed()
         return item
 
+    # -- Claude Code sessions
+    #
+    # A to-do sent to Claude Code gets a run id.  The session leaves "<run>.done" in
+    # claude_runs_dir when Claude finishes its turn (a Stop hook), and "<run>.exit" when
+    # the claude command ends.  finish_claude_runs() turns those into done / not-working.
+
+    @property
+    def claude_runs_dir(self):
+        return os.path.join(os.path.dirname(self.path), "claude-runs")
+
+    def start_claude_run(self, item_ids, run):
+        """Mark items as being worked on by Claude Code session `run` (replacing any earlier one)."""
+        stamp = now_str()
+        for iid in item_ids:
+            it = self.get_item(iid)
+            if it:
+                it["claude_sent_at"], it["claude_run"] = stamp, run
+        self.changed()
+
+    def finish_claude_runs(self):
+        """Apply the markers sessions left.  Returns (items marked done, items whose session
+        ended without finishing).  Markers are removed once read."""
+        try:
+            names = os.listdir(self.claude_runs_dir)
+        except OSError:
+            return [], []
+        finished_runs = {n[:-5] for n in names if n.endswith(".done")}
+        exited_runs = {n[:-5] for n in names if n.endswith(".exit")}
+        finished, abandoned = [], []
+        stamp, touched = now_str(), False
+        for it in self.items:
+            run = it.get("claude_run")
+            if run and (run in finished_runs or run in exited_runs):
+                touched = True
+            if run in finished_runs:
+                it["claude_run"] = None
+                if not it["done"]:
+                    it["done"], it["completed_at"] = True, stamp
+                    finished.append(it)
+            elif run in exited_runs:
+                it["claude_run"] = None
+                if not it["done"]:
+                    abandoned.append(it)
+        for n in names:
+            if n.endswith((".done", ".exit")):
+                try:
+                    os.remove(os.path.join(self.claude_runs_dir, n))
+                except OSError:
+                    pass
+        if touched:
+            self.changed()
+        return finished, abandoned
+
     def set_done(self, item_id, done):
         item = self.get_item(item_id)
         if item and item["done"] != done:
@@ -328,6 +387,50 @@ class Store:
         if i != j:
             self.lists.insert(j, self.lists.pop(i))
             self.changed()
+
+    # -- Microsoft Teams
+
+    def teams_request(self):
+        """What the Teams check needs to know: how far earlier checks got in each chat."""
+        return {"checked": dict(self.settings.get("teams_checked") or {})}
+
+    def teams_list(self, create=False):
+        lst = next((x for x in self.lists if x["name"].strip().lower() == TEAMS_LIST.lower()), None)
+        if not lst and create:
+            lst = {"id": new_id(), "name": TEAMS_LIST, "color": "purple", "folder": None}
+            self.lists.append(lst)
+        return lst
+
+    def add_teams_tasks(self, tasks, checked=None):
+        """Add the to-dos a Teams check found and remember how far it got.  Returns the new items.
+
+        They all go to the "Teams" list.  A message that already has a to-do isn't added again.
+        """
+        have = {it["teams_id"] for it in self.items if it.get("teams_id")}
+        added = []
+        for t in tasks or []:
+            title = (t.get("title") or "").strip()
+            if not title or (t.get("teams_id") and t["teams_id"] in have):
+                continue
+            lst = self.teams_list(create=True)
+            prio = t.get("priority")
+            item = dict(ITEM_DEFAULTS, id=new_id(), title=title, notes=t.get("notes") or "", created=now_str(),
+                        list_id=lst["id"], priority=prio if prio in (0, 1, 2, 3) else 0, images=[],
+                        teams_id=t.get("teams_id"), teams_url=t.get("url"))
+            self.items.append(item)
+            added.append(item)
+        marks = dict(self.settings.get("teams_checked") or {})
+        for chat, msg in (checked or {}).items():
+            try:
+                if int(msg) > int(marks.get(chat) or 0):
+                    marks[chat] = str(msg)
+            except (TypeError, ValueError):
+                pass
+        if len(marks) > TEAMS_CHATS_KEPT:     # keep the chats with the newest messages
+            marks = dict(sorted(marks.items(), key=lambda kv: int(kv[1]))[-TEAMS_CHATS_KEPT:])
+        self.settings["teams_checked"] = marks
+        self.changed()
+        return added
 
     def set_setting(self, key, value):
         if self.settings.get(key) != value:

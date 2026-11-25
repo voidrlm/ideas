@@ -5,9 +5,12 @@ to-dos (with their images) can then be sent to Claude Code in that folder.
 Everything lives in one JSON file (~/.local/share/ideas/data.json).
 """
 
+import json
 import os
+import shlex
 import shutil
 import sys
+import threading
 
 import gi
 
@@ -18,6 +21,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
 import ideas_core as core  # noqa: E402
+import ideas_git as gitx  # noqa: E402
 
 APP_ID = "io.github.voidrlm.Ideas"
 APP_NAME = "Ideas"
@@ -28,6 +32,7 @@ DATA_FILE = os.environ.get("IDEAS_DATA") or os.path.join(GLib.get_user_data_dir(
 # login entry it used for notifications is removed.
 OLD_DATA_DIR = os.path.join(GLib.get_user_data_dir(), "reminders")
 OLD_AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "io.github.voidrlm.Reminders.desktop")
+TEAMS_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ideas_teams.py")
 
 
 def migrate_old_data():
@@ -64,7 +69,10 @@ def build_css():
     .claude-btn:hover { background-color: alpha(#d97757, 0.28); }
     .claude-btn:active { background-color: alpha(#d97757, 0.38); }
     .claude-btn.sent { background-color: alpha(currentColor, 0.08); color: inherit; font-weight: normal; opacity: 0.75; }
+    .claude-working { color: #d97757; }
     .claude-btn.sent:hover { background-color: alpha(currentColor, 0.14); opacity: 1; }
+    .git-btn { min-width: 26px; min-height: 26px; padding: 0; margin: -4px 0; color: var(--accent-color); }
+    .git-files { font-family: monospace; font-size: 0.9em; }
     """
     for name, hexc in core.COLORS:
         css += f"""
@@ -114,10 +122,12 @@ TERMINALS = [
 ]
 
 
-def launch_claude(folder, prompt, extra_dirs=()):
+def launch_claude(folder, prompt, extra_dirs=(), marker=None):
     """Open a terminal in `folder` running Claude Code with `prompt`.  Returns an error or None.
 
     extra_dirs (where attached images live) are passed with --add-dir so Claude can read them.
+    marker: path prefix; "<marker>.done" is touched when Claude finishes its turn (a Stop hook)
+    and "<marker>.exit" when the claude command ends, so the app can tell how it went.
     """
     if not folder or not os.path.isdir(folder):
         return "The linked folder doesn't exist any more"
@@ -128,17 +138,76 @@ def launch_claude(folder, prompt, extra_dirs=()):
     if not term:
         return "No terminal app found"
     argv = [claude]
+    if marker:
+        hook = {"type": "command", "command": "touch " + shlex.quote(marker + ".done")}
+        argv += ["--settings", json.dumps({"hooks": {"Stop": [{"hooks": [hook]}]}})]
     for d in extra_dirs:
         argv += ["--add-dir", d]
     argv += ["--", prompt]      # "--" ends options: --add-dir takes several values, and prompts may start with "-"
-    # After Claude exits, stay in a shell in that folder instead of closing the window.
-    script = 'cd "$1" || exit 1; shift; "$@"; exec "${SHELL:-bash}" -l'
-    cmd = [term[0], *term[1], "bash", "-lc", script, "claude-code", folder, *argv]
+    # Note when Claude exits (also if the window is closed), then stay in a shell in that
+    # folder instead of closing the window.
+    script = ('cd "$1" || exit 1; m="$2"; shift 2; '
+              'trap \'[ -n "$m" ] && touch "$m"; exit 129\' HUP TERM; '
+              '"$@"; [ -n "$m" ] && touch "$m"; trap - HUP TERM; exec "${SHELL:-bash}" -l')
+    exit_marker = marker + ".exit" if marker else ""
+    cmd = [term[0], *term[1], "bash", "-lc", script, "claude-code", folder, exit_marker, *argv]
     try:
         spawn(cmd, cwd=folder)
     except GLib.Error as e:
         return f"Couldn't open the terminal: {e.message}"
     return None
+
+
+# ---------------------------------------------------------------- Microsoft Teams
+
+
+class TeamsCheck:
+    """One run of ideas_teams.py: on_event(dict) for each line it prints, then on_done()."""
+
+    def __init__(self, request, login, on_event, on_done):
+        self.on_event, self.on_done = on_event, on_done
+        argv = [sys.executable, TEAMS_SCRIPT, "--data-dir", os.path.dirname(DATA_FILE)] + (["--login"] if login else [])
+        flags = Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
+        self.proc = Gio.SubprocessLauncher.new(flags).spawnv(argv)       # raises GLib.Error
+        stdin = self.proc.get_stdin_pipe()
+        data = GLib.Bytes.new(json.dumps(request).encode())
+        stdin.write_bytes_async(data, GLib.PRIORITY_DEFAULT, None, lambda s, res: (self._finish_write(s, res)))
+        self.lines = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self._read()
+
+    @staticmethod
+    def _finish_write(stream, res):
+        try:
+            stream.write_bytes_finish(res)
+        except GLib.Error:
+            pass
+        stream.close_async(GLib.PRIORITY_DEFAULT, None, None)
+
+    def _read(self):
+        self.lines.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line)
+
+    def _on_line(self, stream, res):
+        try:
+            line, _n = stream.read_line_finish_utf8(res)
+        except GLib.Error:
+            line = None
+        if line is None:                    # the helper has finished
+            self.proc.wait_async(None, lambda p, r: p.wait_finish(r))
+            on_done, self.on_done, self.on_event = self.on_done, None, None
+            if on_done:
+                on_done()
+            return
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if isinstance(event, dict) and self.on_event:
+            self.on_event(event)
+        self._read()
+
+    def cancel(self):
+        self.on_done = self.on_event = None
+        self.proc.force_exit()
 
 
 # ---------------------------------------------------------------- images
@@ -290,6 +359,22 @@ def plural(n, word):
     return f"{n} {word}{'' if n == 1 else 's'}"
 
 
+def join_names(names):
+    names = list(names)
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def in_background(work, done):
+    """Run work() off the main thread, then done(result) back on it."""
+    def run():
+        try:
+            result = work()
+        except Exception as e:          # report it instead of dying silently in a thread
+            result = e
+        GLib.idle_add(lambda: done(result) and False)
+    threading.Thread(target=run, daemon=True).start()
+
+
 # ===================================================================== application
 
 
@@ -308,6 +393,7 @@ class IdeasApp(Adw.Application):
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         migrate_old_data()
         self.store = core.Store(DATA_FILE)
+        self._watch_claude_runs()
         try:
             os.remove(OLD_AUTOSTART_FILE)
         except OSError:
@@ -344,6 +430,38 @@ class IdeasApp(Adw.Application):
         if self.window is None or self.window not in self.get_windows():
             self.window = MainWindow(self)
         self.window.present()
+        self.check_claude_runs()        # sessions that finished while Ideas was closed
+
+    # -- Claude Code sessions finishing
+
+    def _watch_claude_runs(self):
+        self._runs_check_queued = False
+        os.makedirs(self.store.claude_runs_dir, exist_ok=True)
+        self._runs_monitor = Gio.File.new_for_path(self.store.claude_runs_dir).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None)
+        self._runs_monitor.connect("changed", lambda *_: self._queue_claude_check())
+
+    def _queue_claude_check(self):
+        if not self._runs_check_queued:
+            self._runs_check_queued = True
+            GLib.timeout_add(200, self.check_claude_runs)
+
+    def check_claude_runs(self):
+        self._runs_check_queued = False
+        finished, abandoned = self.store.finish_claude_runs()
+        win = self.window if self.window in self.get_windows() else None
+        if win and finished:
+            ids = [it["id"] for it in finished]
+
+            def undo():
+                for iid in ids:
+                    self.store.set_done(iid, False)
+            what = f"“{finished[0]['title']}”" if len(finished) == 1 else plural(len(finished), "to-do")
+            win.toast(f"Claude Code finished {what}: marked done", undo)
+        if win and abandoned:
+            what = f"“{abandoned[0]['title']}”" if len(abandoned) == 1 else plural(len(abandoned), "to-do")
+            win.toast(f"Claude Code closed before finishing {what}, so it's still open")
+        return False
 
     def window_closed(self, win):
         if self.window is win:
@@ -365,7 +483,8 @@ class IdeasApp(Adw.Application):
         d = Adw.ShortcutsDialog()
         for title, items in (
             ("To-dos", [("New to-do", "<Control>n"), ("Search", "<Control>f"),
-                        ("Show or hide completed", "<Control>h"), ("Paste an image", "<Control>v")]),
+                        ("Show or hide completed", "<Control>h"), ("Paste an image", "<Control>v"),
+                        ("Check Teams for tasks", "<Control>t")]),
             ("General", [("New list", "<Control><Shift>n"), ("Keyboard shortcuts", "<Control>question"),
                          ("Close window", "<Control>w"), ("Quit", "<Control>q")]),
         ):
@@ -399,6 +518,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.list_id = st.get("last_list") if self.store.get_list(st.get("last_list")) else self.store.lists[0]["id"]
         self._building = False
         self.pending_images = []
+        self.teams = None               # a TeamsCheck while one is running
+        self.git_state = {}             # list id -> repositories with something to commit or push
+        self.git_busy = set()           # list ids being committed and pushed right now
+        self._git_checking = self._git_again = self._closed = False
 
         self.toasts = Adw.ToastOverlay()
         self.split = Adw.NavigationSplitView(min_sidebar_width=220, max_sidebar_width=280)
@@ -420,10 +543,19 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.store.connect(self._on_store_changed)
         self.connect("close-request", self._on_close_request)
+        # Uncommitted work shows up when you come back to the window, and every half minute.
+        self.connect("notify::is-active", lambda *_: self.is_active() and self.refresh_git())
+        self._git_timer = GLib.timeout_add_seconds(30, lambda: (self.is_active() and self.refresh_git(), True)[1])
         self.refresh()
+        self.refresh_git()
         self.split.set_show_content(True)
 
     def _on_close_request(self, _win):
+        self._closed = True
+        GLib.source_remove(self._git_timer)
+        if self.teams:
+            self.teams.cancel()
+            self.teams = None
         self._clear_pending()
         st = self.store.settings
         st["window_maximized"] = self.is_maximized()
@@ -457,6 +589,9 @@ class MainWindow(Adw.ApplicationWindow):
         add("item-delete", lambda a, v: self.delete_item(v.get_string()), "s")
         add("item-claude", lambda a, v: self.send_to_claude([v.get_string()]), "s")
         add("list-claude", lambda a, v: self.send_list_to_claude(v.get_string()), "s")
+        add("list-push", lambda a, v: self.push_list(v.get_string()), "s")
+        add("teams-check", lambda *a: self.check_teams(), accels=["<Control>t"])
+        add("teams-login", lambda *a: self.check_teams(login=True))
         show = Gio.SimpleAction.new_stateful("show-completed", None,
                                              GLib.Variant("b", self.store.settings["show_completed"]))
         show.connect("change-state", self._on_show_completed)
@@ -474,12 +609,22 @@ class MainWindow(Adw.ApplicationWindow):
         hb = Adw.HeaderBar()
         menu = Gio.Menu()
         menu.append("New List", "win.new-list")
+        teams = Gio.Menu()
+        teams.append("Check Teams for Tasks", "win.teams-check")
+        teams.append("Sign In to Teams…", "win.teams-login")
+        menu.append_section(None, teams)
         sec = Gio.Menu()
         sec.append("Keyboard Shortcuts", "app.shortcuts")
         sec.append("About Ideas", "app.about")
         menu.append_section(None, sec)
         hb.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Main Menu",
                                    primary=True))
+        self.teams_stack = Gtk.Stack()
+        self.teams_stack.add_named(Gtk.Image(icon_name="chat-message-new-symbolic"), "idle")
+        self.teams_stack.add_named(Adw.Spinner(), "busy")
+        self.teams_btn = Gtk.Button(child=self.teams_stack, action_name="win.teams-check")
+        hb.pack_start(self.teams_btn)
+        self._teams_busy(False)
         tv.add_top_bar(hb)
 
         self.sidebar_list = Gtk.ListBox(css_classes=["navigation-sidebar"])
@@ -515,6 +660,14 @@ class MainWindow(Adw.ApplicationWindow):
             if lst.get("folder"):
                 box.append(Gtk.Image(icon_name="folder-symbolic", pixel_size=12, css_classes=["dim-label"],
                                      tooltip_text=core.short_path(lst["folder"])))
+            if lst["id"] in self.git_busy:
+                box.append(Gtk.Button(child=Adw.Spinner(), css_classes=["flat", "circular", "git-btn"], sensitive=False,
+                                      valign=Gtk.Align.CENTER, tooltip_text="Committing and pushing…"))
+            elif self.git_state.get(lst["id"]):
+                push = Gtk.Button(icon_name="send-to-symbolic", css_classes=["flat", "circular", "git-btn"],
+                                  valign=Gtk.Align.CENTER, tooltip_text=self._git_summary(self.git_state[lst["id"]]))
+                push.connect("clicked", lambda _b, lid=lst["id"]: self.push_list(lid))
+                box.append(push)
             n = counts.get(lst["id"], 0)
             box.append(Gtk.Label(label=str(n) if n else "", css_classes=["sidebar-count"]))
             row.set_child(box)
@@ -554,6 +707,8 @@ class MainWindow(Adw.ApplicationWindow):
         if lst and lst.get("folder"):
             cc = Gio.Menu()
             cc.append("Send Open To-dos to Claude Code", f"win.list-claude::{list_id}")
+            if self.git_state.get(list_id) and list_id not in self.git_busy:
+                cc.append("Commit and Push Changes…", f"win.list-push::{list_id}")
             menu.append_section(None, cc)
         menu.append("Edit List…", f"win.edit-list::{list_id}")
         order = Gio.Menu()
@@ -799,7 +954,13 @@ class MainWindow(Adw.ApplicationWindow):
         text.append(title_box)
 
         meta = Gtk.Box(spacing=8, css_classes=["item-meta"])
-        if it.get("claude_sent_at"):
+        if it.get("claude_run") and not it["done"]:
+            sent = Gtk.Box(spacing=4, css_classes=["claude-working"],
+                           tooltip_text="Claude Code is working on this; it's marked done when Claude finishes")
+            sent.append(Adw.Spinner(width_request=12, height_request=12))
+            sent.append(Gtk.Label(label="Claude is working…"))
+            meta.append(sent)
+        elif it.get("claude_sent_at"):
             sent = Gtk.Box(spacing=4, css_classes=["dim-label"])
             sent.append(Gtk.Image(icon_name="utilities-terminal-symbolic", pixel_size=12))
             sent.append(Gtk.Label(label="Sent to Claude"))
@@ -883,13 +1044,181 @@ class MainWindow(Adw.ApplicationWindow):
         # Let the tick animation play before the row moves away.
         GLib.timeout_add(350 if done else 0, apply)
 
-    def toast(self, text, undo=None):
-        t = Adw.Toast(title=text, timeout=5)
-        t.set_use_markup(False)
+    def toast(self, text, undo=None, action=None):
+        """action: (button label, callback) for something other than Undo."""
         if undo:
-            t.set_button_label("Undo")
-            t.connect("button-clicked", lambda *_: undo())
+            action = ("Undo", undo)
+        t = Adw.Toast(title=text, timeout=10 if action and not undo else 5)
+        t.set_use_markup(False)
+        if action:
+            t.set_button_label(action[0])
+            t.connect("button-clicked", lambda *_: action[1]())
         self.toasts.add_toast(t)
+
+    # -- git: commit and push a list's folder
+
+    @staticmethod
+    def _git_summary(repos):
+        parts = []
+        for st in repos:
+            what = [plural(len(st["files"]), "uncommitted change")] if st["files"] else []
+            if st["ahead"]:
+                what.append(plural(st["ahead"], "unpushed commit"))
+            parts.append(f"{st['name']}: {' and '.join(what)}")
+        return "Commit and push\n" + "\n".join(parts)
+
+    def refresh_git(self):
+        """Look (in the background) for uncommitted or unpushed work in the lists' folders."""
+        if self._git_checking:
+            self._git_again = True
+            return
+        folders = {lst["id"]: lst["folder"] for lst in self.store.lists if lst.get("folder")}
+        if not folders:
+            if self.git_state:
+                self.git_state = {}
+                self._rebuild_sidebar()
+            return
+        self._git_checking = True
+
+        def done(state):
+            self._git_checking = False
+            if self._closed:
+                return
+            if isinstance(state, dict) and state != self.git_state:
+                self.git_state = state
+                self._rebuild_sidebar()
+            if self._git_again:
+                self._git_again = False
+                self.refresh_git()
+        in_background(lambda: {lid: st for lid, st in ((lid, gitx.folder_status(f)) for lid, f in folders.items()) if st}, done)
+
+    def push_list(self, list_id):
+        """Commit everything uncommitted under the list's folder and push it, after a look at what that is."""
+        lst = self.store.get_list(list_id)
+        if not lst or not lst.get("folder") or list_id in self.git_busy:
+            return
+        folder = lst["folder"]
+
+        def checked(repos):
+            if self._closed:
+                return
+            if not isinstance(repos, list) or not repos:
+                self.toast(f"Nothing to commit or push in {core.short_path(folder)}")
+                self.refresh_git()
+                return
+            smart = gitx.find_smart_commit()
+            if any(st["files"] for st in repos) and not smart:
+                self.toast("smart-commit is missing from the Ideas folder, so no commit message can be written")
+                return
+            self._confirm_push(list_id, repos, smart)
+        in_background(lambda: gitx.folder_status(folder), checked)
+
+    def _confirm_push(self, list_id, repos, smart):
+        commits = any(st["files"] for st in repos)
+        names = join_names(st["name"] for st in repos)
+        d = Adw.AlertDialog(heading="Commit and Push?" if commits else "Push?",
+                            body=(f"Everything below is committed in {names} with a message written from the changes, "
+                                  "then pushed." if commits else f"Pushes the commits waiting in {names}."))
+        lines = []
+        for st in repos:
+            lines.append(f"{st['name']} · {st['branch'] or 'no branch'}"
+                         + (f" · {plural(st['ahead'], 'commit')} to push" if st["ahead"] else ""))
+            lines += [f"  {code:<2} {path}" for code, path in st["files"][:12]]
+            if len(st["files"]) > 12:
+                lines.append(f"  … and {len(st['files']) - 12} more")
+        label = Gtk.Label(label="\n".join(lines), xalign=0, yalign=0, selectable=False, css_classes=["git-files"],
+                          ellipsize=Pango.EllipsizeMode.MIDDLE, margin_top=8, margin_bottom=8, margin_start=10, margin_end=10)
+        d.set_extra_child(Gtk.ScrolledWindow(child=label, css_classes=["card"], hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                             propagate_natural_height=True, max_content_height=260, min_content_width=360))
+        d.add_response("cancel", "Cancel")
+        d.add_response("push", "Commit and Push" if commits else "Push")
+        d.set_response_appearance("push", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("push")
+        d.set_close_response("cancel")
+        d.connect("response", lambda _d, resp: resp == "push" and self._do_push(list_id, repos, smart))
+        d.present(self)
+
+    def _do_push(self, list_id, repos, smart):
+        self.git_busy.add(list_id)
+        self._rebuild_sidebar()
+
+        def done(results):
+            self.git_busy.discard(list_id)
+            if self._closed:
+                return
+            self._rebuild_sidebar()
+            self.refresh_git()
+            if not isinstance(results, list):
+                self.toast(f"Commit and push failed: {results}")
+                return
+            failed = [r for r in results if r["error"]]
+            if failed:
+                d = Adw.AlertDialog(heading="Not Everything Was Pushed",
+                                    body="\n\n".join(f"{r['name']}: {r['error']}" for r in failed))
+                d.add_response("ok", "OK")
+                d.present(self)
+            ok = [r for r in results if r["pushed"]]
+            if len(ok) == 1 and ok[0]["committed"]:
+                self.toast(f"Pushed {ok[0]['name']}: {ok[0]['committed']}")
+            elif ok:
+                self.toast(("Committed and pushed " if any(r["committed"] for r in ok) else "Pushed ")
+                           + join_names(r["name"] for r in ok))
+        in_background(lambda: [gitx.commit_and_push(st["path"], smart) for st in repos], done)
+
+    # -- Microsoft Teams
+
+    def _teams_busy(self, busy, status=None):
+        self.teams_stack.set_visible_child_name("busy" if busy else "idle")
+        self.teams_btn.set_tooltip_text(status or "Check Teams for Tasks (Ctrl+T)\n"
+                                        "Reads your unread chats without marking them as read")
+
+    def check_teams(self, login=False):
+        """Look through unread Teams chats for things to do and add them to the Teams list."""
+        if self.teams:
+            return
+        got = {"answer": False}
+
+        def on_event(ev):
+            kind = ev.get("event")
+            if kind == "status":
+                self._teams_busy(True, ev.get("text"))
+                if ev.get("toast"):
+                    self.toast(ev.get("text", ""))
+            elif kind == "login":
+                got["answer"] = True
+                self.toast("Sign in to Teams to check it for tasks", action=("Sign In", lambda: self.check_teams(login=True)))
+            elif kind == "error":
+                got["answer"] = True
+                self.toast(ev.get("text") or "Teams check failed")
+            elif kind == "result":
+                got["answer"] = True
+                self._teams_result(ev)
+
+        def on_done():
+            self.teams = None
+            self._teams_busy(False)
+            if not got["answer"]:
+                self.toast("The Teams check stopped unexpectedly")
+
+        try:
+            self.teams = TeamsCheck(self.store.teams_request(), login, on_event, on_done)
+        except GLib.Error as e:
+            self.toast(f"Couldn't start the Teams check: {e.message}")
+            return
+        self._teams_busy(True, "Checking Teams…")
+
+    def _teams_result(self, ev):
+        added = self.store.add_teams_tasks(ev.get("tasks"), ev.get("checked"))
+        if not added:
+            n = ev.get("messages") or 0
+            self.toast(f"No tasks for you in {plural(n, 'new Teams message')}" if n else "Nothing new in Teams")
+            return
+        ids = [it["id"] for it in added]
+        self.list_id = added[0]["list_id"]          # show the Teams list
+        if self.search_bar.get_search_mode():
+            self.search_bar.set_search_mode(False)
+        self.refresh(scroll_top=True)
+        self.toast(f"Added {plural(len(added), 'to-do')} from Teams", lambda: self.store.delete_items(ids))
 
     def send_to_claude(self, item_ids, list_id=None):
         items = [it for it in (self.store.get_item(i) for i in item_ids) if it]
@@ -900,29 +1229,22 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast("Link a folder to this list first (Edit List…)")
             return
         has_images = any(it["images"] for it in items)
+        run = core.new_id()
         try:
+            os.makedirs(self.store.claude_runs_dir, exist_ok=True)
             err = launch_claude(lst["folder"], core.claude_prompt(items, lst["name"], self.store.image_path),
-                                [self.store.images_dir] if has_images else ())
+                                [self.store.images_dir] if has_images else (),
+                                marker=os.path.join(self.store.claude_runs_dir, run))
         except Exception as e:      # never fail silently: say what went wrong
             err = f"Couldn't start Claude Code: {e}"
         if err:
             self.toast(err)
             return
-        # Handed off to Claude, so it's done; Undo puts the open ones back.
-        stamp = core.now_str()
-        reopened = [it["id"] for it in items if not it["done"]]
-        for it in items:
-            it["claude_sent_at"] = stamp
-            if not it["done"]:
-                it["done"], it["completed_at"] = True, stamp
-        self.store.changed()
-
-        def undo():
-            for iid in reopened:
-                self.store.set_done(iid, False)
+        # They're marked done when Claude finishes (see Application.check_claude_runs).
+        self.store.start_claude_run([it["id"] for it in items], run)
         what = f"“{items[0]['title']}”" if len(items) == 1 else plural(len(items), "to-do")
-        self.toast(f"Sent {what} to Claude Code in {os.path.basename(lst['folder'].rstrip(os.sep))} and marked done",
-                   undo if reopened else None)
+        self.toast(f"Sent {what} to Claude Code in {os.path.basename(lst['folder'].rstrip(os.sep))}. "
+                   "It's marked done when Claude finishes.")
 
     def send_list_to_claude(self, list_id):
         ids = [it["id"] for _h, its in self.store.sections(list_id) for it in its if not it["done"]]
@@ -1121,6 +1443,13 @@ class ItemDialog(Adw.Dialog):
         page.add(self.claude_group)
         self.list_row.connect("notify::selected", lambda *_: self._sync_claude())
 
+        if item.get("teams_url"):
+            gt = Adw.PreferencesGroup(description="Opening the message in Teams marks that chat as read.")
+            teams_row = Adw.ButtonRow(title="Open in Teams", start_icon_name="chat-message-new-symbolic")
+            teams_row.connect("activated", lambda *_: Gtk.UriLauncher.new(item["teams_url"]).launch(self.win, None, None))
+            gt.add(teams_row)
+            page.add(gt)
+
         gx = Adw.PreferencesGroup()
         delete = Adw.ButtonRow(title="Delete To-do", start_icon_name="user-trash-symbolic",
                                css_classes=["destructive-action"])
@@ -1191,7 +1520,8 @@ class ItemDialog(Adw.Dialog):
         self.claude_group.set_visible(bool(lst.get("folder")))
         if lst.get("folder"):
             self.claude_group.set_description(f"Opens a terminal in {core.short_path(lst['folder'])} and runs "
-                                              "Claude Code with this to-do and its images as the prompt.")
+                                              "Claude Code with this to-do and its images as the prompt. "
+                                              "It's marked done when Claude finishes.")
 
     def _on_claude(self, *_):
         self.close()        # saves edits first, so Claude gets the latest text

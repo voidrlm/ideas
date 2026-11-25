@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""smart-commit — write an accurate commit message from the diff itself. No AI, no network.
+
+    smart-commit                 message for what is staged; then commit / edit / quit
+    smart-commit -a              stage every change first (git add -A)
+    smart-commit -n              only print the message
+    smart-commit -y              commit without asking          (-p: push afterwards)
+    smart-commit -m "why"        the reason, in your words: becomes the first paragraph
+    smart-commit -t fix          set the type yourself (feat, fix, refactor, docs, ...)
+    smart-commit -b / -B         always / never write the per-file body (default: as the
+                                 repository's history does)
+    smart-commit --rev <commit>  print the message it would write for an existing commit
+    smart-commit --install-hook  make plain `git commit` here open with the message filled in
+
+How it gets the message right, in any project and any language:
+
+  * It reads the real diff: which files were added, deleted, renamed or modified, and inside
+    them which functions, classes, types, routes, tables, settings and dependencies were
+    added, changed or removed. Every word of the message comes from one of those facts.
+  * It learns the repository's convention from its last 200 commits and writes the same way:
+    Conventional Commits ("feat(api): ..."), an area prefix ("Billing: ..."), a ticket id or
+    plain sentences; the type it gives ordinary changes; whether and how it scopes (a folder,
+    or a component name); its verbs ("enhance" rather than "update"); its capitalisation; how
+    long its subjects run; "add X; update Y" clauses; and whether commits have a body at all.
+  * It never claims what a diff cannot show. A script cannot know WHY you made a change, so
+    the reason is yours to give with -m; without it the message says what changed, precisely.
+
+Needs only git and Python 3.8+. Put it on your PATH (for example
+`install -m 755 smart-commit ~/.local/bin/`); named git-smart-commit it runs as `git smart-commit`.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import textwrap
+from collections import Counter, OrderedDict
+
+SUBJECT_MAX = 72
+WRAP = 72
+
+# ── git ──────────────────────────────────────────────────────────────────────
+
+def git(*args, check=True):
+    done = subprocess.run(['git', '-c', 'core.quotepath=off', *args], capture_output=True, text=True, errors='replace')
+    if check and done.returncode != 0:
+        sys.exit(f"smart-commit: git {' '.join(args[:3])} failed: {done.stderr.strip()}")
+    return done.stdout
+
+
+def die(message):
+    sys.exit(f'smart-commit: {message}')
+
+
+# ── what kind of file is it ──────────────────────────────────────────────────
+
+LOCKS = re.compile(r'(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|poetry\.lock|uv\.lock|'
+                   r'Pipfile\.lock|Cargo\.lock|composer\.lock|Gemfile\.lock|go\.sum|flake\.lock|mix\.lock|pubspec\.lock|Podfile\.lock)$')
+MANIFESTS = re.compile(r'(^|/)(package\.json|requirements[\w.-]*\.txt|pyproject\.toml|setup\.(py|cfg)|Pipfile|go\.mod|Cargo\.toml|'
+                       r'composer\.json|Gemfile|pom\.xml|build\.gradle(\.kts)?|pubspec\.yaml|mix\.exs|[\w.-]+\.csproj)$')
+BUILD = re.compile(r'(^|/)(Dockerfile[\w.-]*|docker-compose[\w.-]*\.ya?ml|compose\.ya?ml|Makefile|CMakeLists\.txt|[\w.-]*\.mk|'
+                   r'vite\.config\.\w+|webpack\.config\.\w+|rollup\.config\.\w+|tsconfig[\w.-]*\.json|babel\.config\.\w+|\.babelrc)$')
+CI = re.compile(r'(^|/)(\.github/workflows/|\.gitlab-ci\.yml$|\.circleci/|Jenkinsfile$|azure-pipelines\.yml$|\.travis\.yml$|'
+                r'bitbucket-pipelines\.yml$|\.drone\.yml$|ci/)')
+DOCS = re.compile(r'(\.(md|mdx|rst|adoc|txt)$)|(^|/)(docs?|documentation)/|(^|/)(README|CHANGELOG|CONTRIBUTING|LICENSE|NOTICE|AUTHORS)[\w.-]*$', re.I)
+TESTS = re.compile(r'(^|/)(tests?|__tests__|spec|specs|e2e|cypress|testdata|fixtures)/|(^|/)(test_[\w.-]+|[\w.-]+_test\.\w+|'
+                   r'[\w.-]+\.(test|spec)\.\w+|conftest\.py)$', re.I)
+STYLE = re.compile(r'\.(css|scss|sass|less|styl)$', re.I)
+ASSET = re.compile(r'\.(png|jpe?g|gif|webp|svg|ico|bmp|ttf|otf|woff2?|eot|mp[34]|wav|ogg|webm|mov|pdf|zip|gz|xlsx?|docx?|pptx?)$', re.I)
+MIGRATION = re.compile(r'(^|/)(migrations?|alembic/versions|db/migrate|db_schemas?)/|\.sql$', re.I)
+CONFIG = re.compile(r'(\.(ya?ml|toml|ini|cfg|conf|properties|env\.example)$)|(^|/)\.[\w.-]+rc(\.\w+)?$|(^|/)\.(gitignore|gitattributes|'
+                    r'editorconfig|dockerignore|npmignore|prettierignore|eslintignore)$', re.I)
+I18N = re.compile(r'(^|/)(i18n|l10n|locales?|lang|translations?|messages)/', re.I)
+
+
+def category(path):
+    if LOCKS.search(path) or MANIFESTS.search(path):
+        return 'deps'
+    if CI.search(path):
+        return 'ci'
+    if TESTS.search(path):
+        return 'test'
+    if BUILD.search(path):
+        return 'build'
+    if MIGRATION.search(path):
+        return 'db'
+    if DOCS.search(path):
+        return 'docs'
+    if ASSET.search(path):
+        return 'asset'
+    if STYLE.search(path):
+        return 'style'
+    if I18N.search(path):
+        return 'i18n'
+    if CONFIG.search(path):
+        return 'config'
+    return 'source'
+
+
+# ── names defined in a line of code, per language ────────────────────────────
+
+MOD = r'(?:(?:public|private|protected|internal|static|final|abstract|sealed|override|virtual|async|open|suspend|inline|export|default|readonly|synchronized|unsafe|extern|const)\s+)*'
+DEFS = {
+    'py': [(r'^\s*(?:async\s+)?def\s+(\w+)', 'fn'), (r'^\s*class\s+(\w+)', 'class')],
+    'js': [(r'^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(\w+)', 'fn'),
+           (r'^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w+)', 'class'),
+           (r'^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*(?::[^=]+?)?=>', 'fn'),
+           (r'^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function', 'fn'),
+           (r'^\s*(?:export\s+)?(?:declare\s+)?(?:interface|type|enum)\s+(\w+)', 'tstype')],
+    'go': [(r'^func\s+(?:\([^)]*\)\s*)?(\w+)', 'fn'), (r'^type\s+(\w+)', 'type')],
+    'java': [(r'^\s*' + MOD + r'(?:class|interface|enum|record|object|struct|trait)\s+(\w+)', 'type'),
+             (r'^\s*' + MOD + r'fun\s+(?:<[^>]+>\s*)?(?:[\w.]+\.)?(\w+)', 'fn'),
+             (r'^\s*(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|async|synchronized)\s+)+[\w<>\[\],.? ]+?\s+(\w+)\s*\([^;]*$', 'fn')],
+    'rs': [(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)', 'fn'),
+           (r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|mod|union)\s+(\w+)', 'type')],
+    'rb': [(r'^\s*def\s+(?:self\.)?([\w?!]+)', 'fn'), (r'^\s*(?:class|module)\s+([\w:]+)', 'type')],
+    'php': [(r'^\s*' + MOD + r'function\s+&?(\w+)', 'fn'), (r'^\s*' + MOD + r'(?:class|interface|trait|enum)\s+(\w+)', 'type')],
+    'sh': [(r'^\s*(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\)\s*\{?', 'fn')],
+    'c': [(r'^\s*(?:class|struct|enum|union|namespace)\s+(\w+)', 'type'),
+          (r'^[A-Za-z_][\w\s\*&:<>,]*?[\s\*&](\w+)\s*\([^;]*\)\s*(?:const\s*)?\{?\s*$', 'fn')],
+    'sql': [(r'(?i)^\s*create\s+(?:or\s+replace\s+)?(?:unique\s+)?(?:materialized\s+)?(?:table|index|view|function|procedure|trigger|type|schema)\s+(?:if\s+not\s+exists\s+)?([\w."]+)', 'type'),
+            (r'(?i)^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w."]+)', 'type')],
+    'ex': [(r'^\s*defp?\s+(\w+[?!]?)', 'fn'), (r'^\s*defmodule\s+([\w.]+)', 'type')],
+    'swift': [(r'^\s*' + MOD + r'func\s+(\w+)', 'fn'), (r'^\s*' + MOD + r'(?:class|struct|enum|protocol|extension|actor)\s+(\w+)', 'type')],
+}
+LANG = {'py': 'py', 'pyi': 'py', 'js': 'js', 'jsx': 'js', 'ts': 'js', 'tsx': 'js', 'mjs': 'js', 'cjs': 'js', 'vue': 'js', 'svelte': 'js',
+        'go': 'go', 'java': 'java', 'kt': 'java', 'kts': 'java', 'cs': 'java', 'scala': 'java', 'groovy': 'java', 'dart': 'java',
+        'rs': 'rs', 'rb': 'rb', 'rake': 'rb', 'php': 'php', 'sh': 'sh', 'bash': 'sh', 'zsh': 'sh',
+        'c': 'c', 'h': 'c', 'cc': 'c', 'cpp': 'c', 'cxx': 'c', 'hpp': 'c', 'm': 'c', 'mm': 'c',
+        'sql': 'sql', 'ex': 'ex', 'exs': 'ex', 'swift': 'swift'}
+KEYWORDS = {'if', 'for', 'while', 'switch', 'catch', 'return', 'else', 'elif', 'try', 'do', 'with', 'new', 'await', 'function',
+            'class', 'const', 'let', 'var', 'in', 'of', 'and', 'or', 'not', 'main_', 'constructor', 'super', 'this', 'self'}
+
+ROUTE = re.compile(r'''(?:@?\b(?:router|app|api|bp|blueprint|route|server|r)\.(get|post|put|patch|delete|head|options)\s*\(\s*["'`]([^"'`]+))'''
+                   r'''|(?:@(Get|Post|Put|Patch|Delete)Mapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+))''', re.I)
+ENVVAR = re.compile(r'''os\.(?:getenv|environ\.get)\(\s*["'](\w+)|os\.environ\[\s*["'](\w+)|process\.env\.([A-Z_][A-Z0-9_]+)|'''
+                    r'''import\.meta\.env\.([A-Z_][A-Z0-9_]+)|System\.getenv\(\s*"(\w+)|ENV\[\s*["'](\w+)|os\.Getenv\(\s*"(\w+)|env::var\(\s*"(\w+)''')
+TEST_DEF = re.compile(r'''^\s*(?:async\s+)?def\s+(test_\w+)|^\s*(?:it|test)\s*\(\s*["'`]([^"'`]+)|^func\s+(Test\w+)|^\s*#\[test\]|^\s*@Test\b''')
+NPM_DEP = re.compile(r'^\s*"(@?[\w./-]+)"\s*:\s*"([~^<>=*\d][^"]*|(?:git|http|file|workspace|npm):[^"]*|latest)"\s*,?\s*$')
+PY_DEP = re.compile(r'^\s*([A-Za-z0-9][\w.-]*)\s*(?:\[[^\]]*\])?\s*(?:==|>=|~=|<=|>|<)\s*([\w.*+!-]+)')
+GO_DEP = re.compile(r'^\s*(?:require\s+)?([\w./-]+\.[\w./-]+)\s+(v[\w.+-]+)')
+TOML_DEP = re.compile(r'^\s*([A-Za-z0-9][\w-]*)\s*=\s*(?:"([^"]+)"|\{[^}]*version\s*=\s*"([^"]+)")')
+VERSION = re.compile(r'^\s*"?version"?\s*[:=]\s*"([^"]+)"')
+
+
+def language(path):
+    return LANG.get(path.rsplit('.', 1)[-1].lower()) if '.' in os.path.basename(path) else None
+
+
+def definitions(line, lang):
+    """[(name, kind)] a line of code defines."""
+    found = []
+    for pattern, kind in DEFS.get(lang, ()):
+        match = re.search(pattern, line)
+        if match and match.group(1) not in KEYWORDS:
+            found.append((match.group(1).strip('"'), kind))
+            break
+    return found
+
+
+# ── the diff, parsed ─────────────────────────────────────────────────────────
+
+class Change:
+    def __init__(self, path):
+        self.path, self.old_path = path, None
+        self.status = 'M'             # A, D, R, M
+        self.binary = False
+        self.added, self.removed = 0, 0
+        self.plus, self.minus = [], []          # the changed lines themselves
+        self.contexts = []                      # text after the hunk's second @@ (the enclosing definition)
+        self.hunks = []                         # [context, added lines, removed count], to judge each context
+        self.category = category(path)
+        self.lang = language(path)
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    @property
+    def stem(self):
+        base = self.name
+        base = re.sub(r'\.(module|test|spec|stories|d)\.\w+$', '', base)
+        return base.rsplit('.', 1)[0] if '.' in base and not base.startswith('.') else base
+
+    def symbols(self):
+        """(added, removed, changed): ordered names with their kind."""
+        plus, minus = OrderedDict(), OrderedDict()
+        for line in self.plus:
+            for name, kind in definitions(line, self.lang):
+                plus.setdefault(name, kind)
+        for line in self.minus:
+            for name, kind in definitions(line, self.lang):
+                minus.setdefault(name, kind)
+        changed = OrderedDict((n, k) for n, k in plus.items() if n in minus)      # signature edited
+        added = OrderedDict((n, k) for n, k in plus.items() if n not in minus)
+        removed = OrderedDict((n, k) for n, k in minus.items() if n not in plus)
+        for context in self.contexts:                                             # bodies edited
+            for name, kind in definitions(context, self.lang):
+                if name not in added and name not in removed:
+                    changed.setdefault(name, kind)
+        return added, removed, changed
+
+
+def parse(diff_text):
+    changes, current = [], None
+    for raw in diff_text.split('\n'):
+        if raw.startswith('diff --git '):
+            match = re.match(r'diff --git a/(.*) b/(.*)$', raw)
+            current = Change(match.group(2) if match else raw.split(' b/')[-1])
+            changes.append(current)
+        elif current is None:
+            continue
+        elif raw.startswith('new file mode'):
+            current.status = 'A'
+        elif raw.startswith('deleted file mode'):
+            current.status = 'D'
+        elif raw.startswith('rename from '):
+            current.status, current.old_path = 'R', raw[len('rename from '):]
+        elif raw.startswith('rename to '):
+            current.path = raw[len('rename to '):]
+            current.category, current.lang = category(current.path), language(current.path)
+        elif raw.startswith('Binary files ') or raw.startswith('GIT binary patch'):
+            current.binary = True
+        elif raw.startswith('@@'):
+            current.hunks.append([raw.split('@@', 2)[-1].strip(), [], []])
+        elif raw.startswith('+++') or raw.startswith('---'):
+            continue
+        elif raw.startswith('+'):
+            current.added += 1
+            current.plus.append(raw[1:])
+            if current.hunks:
+                current.hunks[-1][1].append(raw[1:])
+        elif raw.startswith('-'):
+            current.removed += 1
+            current.minus.append(raw[1:])
+            if current.hunks:
+                current.hunks[-1][2].append(raw[1:])
+    lead = re.compile(r'^\s*(@|#|//|/\*|\*|"""|\'\'\'|$)')
+    for change in changes:
+        for context, added, removed in change.hunks:
+            if not context:
+                continue
+            # git names the function ABOVE a hunk. When the hunk itself starts at a definition
+            # (a new one inserted there, or one whose first line was rewritten), the function
+            # above was not touched.
+            first_added = next((line for line in added if not lead.match(line)), '')
+            first_removed = next((line for line in removed if not lead.match(line)), '')
+            if (first_added and definitions(first_added, change.lang)) or (first_removed and definitions(first_removed, change.lang)):
+                continue
+            change.contexts.append(context)
+    return changes
+
+
+# ── facts beyond symbols ─────────────────────────────────────────────────────
+
+def dependency_changes(change):
+    """(added, removed, bumped) from a manifest's changed lines; bumped = [(name, old, new)]."""
+    name = change.name
+    pattern = (NPM_DEP if name in ('package.json', 'composer.json') else GO_DEP if name == 'go.mod'
+               else TOML_DEP if name.endswith('.toml') or name == 'Pipfile' else PY_DEP)
+    def read(lines):
+        found = OrderedDict()
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                version = next((g for g in match.groups()[1:] if g), '')
+                if match.group(1).lower() not in ('version', 'name', 'python', 'description', 'license', 'edition', 'authors'):
+                    found[match.group(1)] = version
+        return found
+    plus, minus = read(change.plus), read(change.minus)
+    bumped = [(n, minus[n], plus[n]) for n in plus if n in minus and minus[n] != plus[n]]
+    return [n for n in plus if n not in minus], [n for n in minus if n not in plus], bumped
+
+
+def version_bump(change):
+    old = next((m.group(1) for m in map(VERSION.match, change.minus) if m), None)
+    new = next((m.group(1) for m in map(VERSION.match, change.plus) if m), None)
+    return (old, new) if old and new and old != new else None
+
+
+def collect(pattern, lines):
+    found = []
+    for line in lines:
+        for match in pattern.finditer(line):
+            groups = [g for g in match.groups() if g]
+            if groups:
+                found.append(' '.join(groups))
+    return found
+
+
+def facts(changes):
+    """Whole-commit facts for the body: routes, settings, dependencies, tables, tests."""
+    out = OrderedDict()
+    routes, envs, tests, tables = [], [], 0, []
+    dep_add, dep_del, dep_bump, versions = [], [], [], []
+    for c in changes:
+        if c.binary:
+            continue
+        if c.category in ('source', 'test'):
+            before = set(collect(ROUTE, c.minus))
+            for found in collect(ROUTE, c.plus):
+                if found not in before:
+                    method, _, path = found.partition(' ')
+                    routes.append(f'{method.upper()} {path}')
+            gone = set(collect(ENVVAR, c.minus))
+            envs += [e for e in collect(ENVVAR, c.plus) if e not in gone]
+        if c.category == 'test':
+            tests += sum(1 for line in c.plus if TEST_DEF.search(line))
+        if c.lang == 'sql' or c.category == 'db':
+            for line in c.plus:
+                match = re.search(r'(?i)^\s*create\s+(?:unlogged\s+)?table\s+(?:if\s+not\s+exists\s+)?([\w."]+)', line)
+                if match:
+                    tables.append(match.group(1).strip('"'))
+        if MANIFESTS.search(c.path):
+            a, d, b = dependency_changes(c)
+            dep_add += a; dep_del += d; dep_bump += b
+            bump = version_bump(c)
+            if bump:
+                versions.append(bump)
+    def unique(items):
+        return list(OrderedDict.fromkeys(items))
+    if versions:
+        out['Version'] = [f'{old} to {new}' for old, new in unique(versions)]
+    if dep_add:
+        out['New dependencies'] = unique(dep_add)
+    if dep_bump:
+        out['Updated dependencies'] = [f'{n} {old} to {new}' for n, old, new in unique(dep_bump)]
+    if dep_del:
+        out['Removed dependencies'] = unique(dep_del)
+    if routes:
+        out['New routes'] = unique(routes)
+    if envs:
+        out['New settings read from the environment'] = unique(envs)
+    if tables:
+        out['New tables'] = unique(tables)
+    if tests:
+        out['Tests added'] = [str(tests)]
+    return out, dep_add, dep_del, dep_bump, versions
+
+
+# ── the repository's own convention ──────────────────────────────────────────
+
+CC = re.compile(r'^(feat|fix|docs|style|refactor|perf|test|tests|build|ci|chore|revert)(\([^)]+\))?(!)?: (.+)$')
+AREA = re.compile(r'^([A-Z][\w .&/+-]{1,40}?): (\S.*)$')
+TICKET = re.compile(r'\b([A-Z][A-Z0-9]{1,9}-\d+)\b|(#\d+)')
+
+
+VERB_FAMILIES = {
+    'add': ('add', 'implement', 'introduce', 'create'),
+    'update': ('update', 'enhance', 'improve', 'refine', 'change', 'modify', 'adjust', 'rework'),
+    'remove': ('remove', 'delete', 'drop'),
+    'rename': ('rename',), 'move': ('move',), 'bump': ('bump', 'upgrade'),
+}
+
+
+class Convention:
+    """How this repository writes commits, learned from its own history. Every habit has a
+    neutral default, so a new repository gets plain, conventional-looking messages."""
+
+    def __init__(self, paths, branch):
+        raw = git('log', '-n', '200', '--no-merges', '--pretty=format:%s%x1f%b%x1e', check=False)
+        commits = [entry.strip('\n').split('\x1f', 1) for entry in raw.split('\x1e') if entry.strip()]
+        subjects = [c[0].strip() for c in commits if c and c[0].strip()]
+        self.subjects = subjects
+        total = max(1, len(subjects))
+        hits = [m for m in map(CC.match, subjects) if m]
+        self.style, self.scope_mode, self.scope_naming = 'plain', 'never', 'dir'
+        self.type_share = Counter()
+        if len(hits) / total >= 0.5 and len(subjects) >= 3:
+            self.style = 'conventional'
+            self.type_share = Counter(m.group(1) for m in hits)
+            scopes = [m.group(2)[1:-1] for m in hits if m.group(2)]
+            ratio = len(scopes) / len(hits)
+            self.scope_mode = 'always' if ratio >= 0.4 else 'sometimes' if ratio >= 0.06 else 'never'
+            # Scopes named after components / files (LoginPage, tableColumns) or after folders (api, brun)?
+            self.scope_naming = 'file' if scopes and sum(1 for x in scopes if re.search(r'[A-Z]', x)) / len(scopes) >= 0.4 else 'dir'
+            texts = [m.group(4) for m in hits]
+        else:
+            areas = [m for m in (AREA.match(x) for x in subjects if not CC.match(x)) if m]
+            if len(areas) / total >= 0.4 and len(subjects) >= 3:
+                self.style = 'area'
+                texts = [m.group(2) for m in areas]
+            else:
+                texts = subjects
+        letters = [t[0] for t in texts if t and t[0].isalpha()]
+        self.capital = (sum(1 for ch in letters if ch.isupper()) / len(letters) >= 0.5) if letters else (self.style != 'conventional')
+        # The verbs this repository reaches for ("enhance" rather than "update", "implement" rather than "add").
+        first = Counter(t.split()[0].lower().rstrip(':') for t in texts if t.split())
+        self.verbs = {}
+        for family, words in VERB_FAMILIES.items():
+            best = max(words, key=lambda w: first.get(w, 0))
+            self.verbs[family] = best if first.get(best, 0) >= 3 else words[0]
+        # How long its subjects run, and whether it writes bodies at all.
+        lengths = sorted(len(x) for x in subjects)
+        self.limit = SUBJECT_MAX
+        if lengths and sum(1 for n in lengths if n > SUBJECT_MAX) / len(lengths) >= 0.3:
+            self.limit = max(SUBJECT_MAX, min(100, lengths[int(len(lengths) * 0.75)]))
+        with_body = sum(1 for c in commits if len(c) > 1 and c[1].strip())
+        self.bodies = (with_body / max(1, len(commits)) >= 0.35) if len(commits) >= 5 else True
+        self.area = self._area_for(paths) if self.style == 'area' else None
+        # A ticket goes in only when the branch has one and this history writes tickets.
+        self.ticket, self.ticket_format = None, None
+        found = re.search(r'([A-Za-z][A-Za-z0-9]{1,9}-\d+)', branch or '')
+        with_ticket = [x for x in subjects if re.match(r'^\[?[A-Z][A-Z0-9]{1,9}-\d+\]?[: ]', x)]
+        if found and len(with_ticket) / total >= 0.3:
+            self.ticket = found.group(1).upper()
+            head = with_ticket[0]
+            self.ticket_format = '[{}] ' if head.startswith('[') else '{}: ' if re.match(r'^[A-Z0-9-]+:', head) else '{} '
+
+    def _area_for(self, paths):
+        """The prefix earlier commits to these same files used most."""
+        prefixes = Counter()
+        for path in paths[:12]:
+            for subject in git('log', '-n', '15', '--no-merges', '--pretty=format:%s', '--', path, check=False).split('\n'):
+                match = AREA.match(subject)
+                if match and not CC.match(subject):
+                    prefixes[match.group(1)] += 1
+        return prefixes.most_common(1)[0][0] if prefixes else None
+
+    def verb(self, family):
+        return self.verbs.get(family, family)
+
+    def usual_type(self):
+        """The type this repository gives ordinary changes, when one clearly dominates."""
+        if not self.type_share:
+            return None
+        kind, count = self.type_share.most_common(1)[0]
+        return kind if count / sum(self.type_share.values()) >= 0.6 else None
+
+    def head(self, kind, scope):
+        if self.style == 'conventional':
+            head = f'{kind}({scope}): ' if scope else f'{kind}: '
+        elif self.style == 'area' and (self.area or scope):
+            head = f'{self.area or scope}: '
+        else:
+            head = ''
+        return (self.ticket_format.format(self.ticket) if self.ticket else '') + head
+
+    def cased(self, phrase):
+        phrase = phrase.strip()
+        if not phrase:
+            return phrase
+        return (phrase[0].upper() if self.capital else phrase[0].lower()) + phrase[1:]
+
+
+# ── scope and type ───────────────────────────────────────────────────────────
+
+CONTAINERS = {'src', 'app', 'apps', 'lib', 'libs', 'packages', 'pkg', 'internal', 'cmd', 'features', 'modules', 'components',
+              'services', 'api', 'endpoints', 'core', 'main', 'java', 'kotlin', 'python', 'server', 'client', 'web', 'backend',
+              'frontend', 'source', 'sources', 'dags', 'tests', 'test'}
+
+
+def scope_of(changes, convention):
+    """The scope this repository would write: '' when it never scopes or the commit is spread out."""
+    if convention.style == 'conventional' and convention.scope_mode == 'never':
+        return ''
+    files = [c for c in changes if not LOCKS.search(c.path)]
+    stems = list(OrderedDict.fromkeys(c.stem for c in files))
+    if convention.style == 'conventional' and convention.scope_naming == 'file' and len(stems) == 1:
+        return stems[0]                       # one component with its styles and tests: feat(LoginPage)
+    votes = Counter()
+    for c in files:
+        pick = next((p for p in c.path.split('/')[:-1] if p.lower() not in CONTAINERS and not p.startswith('.')), None)
+        if pick:
+            votes[pick] += max(1, c.added + c.removed)
+    if not votes:
+        return ''
+    name, weight = votes.most_common(1)[0]
+    share = weight / sum(votes.values())
+    if convention.style == 'conventional' and convention.scope_mode == 'sometimes':
+        return name if share >= 0.95 else ''  # this history scopes only the clear-cut commits
+    return name if share >= 0.7 else ''
+
+
+def type_of(changes, branch, hint, dominant, convention):
+    """The Conventional Commits type the facts support; -t overrides it."""
+    text = f'{branch} {hint}'.lower()
+    for word, kind in (('hotfix', 'fix'), ('bugfix', 'fix'), ('fix', 'fix'), ('bug', 'fix'), ('perf', 'perf'), ('refactor', 'refactor'),
+                       ('feat', 'feat'), ('docs', 'docs'), ('chore', 'chore'), ('revert', 'revert')):
+        if re.search(rf'(^|[^a-z]){word}', text):
+            return kind
+    fixed = {'docs': 'docs', 'test': 'test', 'ci': 'ci', 'deps': 'build', 'build': 'build', 'style': 'style',
+             'config': 'chore', 'asset': 'chore', 'i18n': 'chore', 'db': 'feat'}
+    usual = convention.usual_type()
+    if dominant in fixed:
+        kind = fixed[dominant]
+        # Docs, tests, CI, build and style are facts about the files. Only the catch-all
+        # "chore" gives way to a history that files everything under one type.
+        return usual if kind == 'chore' and usual and not convention.type_share.get('chore') else kind
+    source = [c for c in changes if c.category == 'source']
+    new_files = [c for c in source if c.status == 'A']
+    new_symbols = sum(len(c.symbols()[0]) for c in source if c.status == 'M')
+    if new_files or new_symbols:
+        return 'feat'
+    if source and all(c.status in ('R', 'D') for c in source):
+        return 'refactor'
+    added, removed = sum(c.added for c in source), sum(c.removed for c in source)
+    if removed > added * 2 and removed > 20:
+        return 'refactor'                     # mostly taking code out
+    # An edit to existing code: nothing in a diff says "fix" or "feature", so follow the
+    # repository's habit where it has one, and stay neutral where it does not.
+    if usual:
+        return usual
+    return 'fix' if added + removed <= 30 else 'refactor'
+
+
+# ── saying it ────────────────────────────────────────────────────────────────
+
+def listing(items, limit=3, budget=None):
+    """'a, b and c' / 'a, b and 4 more'; fewer names when they would not fit."""
+    items = list(OrderedDict.fromkeys(items))
+    for take in range(min(limit, len(items)), 0, -1):
+        shown, rest = items[:take], len(items) - take
+        text = (', '.join(shown) + f' and {rest} more') if rest else (shown[0] if take == 1 else ', '.join(shown[:-1]) + ' and ' + shown[-1])
+        if budget is None or len(text) <= budget or take == 1:
+            return text
+    return ''
+
+
+UI_FILE = re.compile(r'\.(tsx|jsx|vue|svelte)$')
+
+
+def noun(name, kind, path):
+    """What a reader would call the thing: component, hook, function, or nothing for a type."""
+    if kind == 'class':
+        return 'class'
+    if kind == 'tstype':
+        return 'type'
+    if kind != 'fn':
+        return ''
+    if re.match(r'use[A-Z]', name):
+        return 'hook'
+    if UI_FILE.search(path) and name[:1].isupper():
+        return 'component'
+    return 'function'
+
+
+def named(items, budget):
+    """[(name, kind, path)] as 'A and B components' / 'x function' / 'A, b and C' (mixed kinds)."""
+    items = list(OrderedDict((i[0], i) for i in items).values())
+    words = {noun(*i) for i in items}
+    word = words.pop() if len(words) == 1 else ''
+    suffix = f' {word}{"s" if len(items) > 1 else ""}' if word else ''
+    return listing([i[0] for i in items], 3, budget - len(suffix)) + suffix
+
+
+def file_names(files, budget):
+    """New / deleted / renamed files by what they are: components, styles, tests, or plain names."""
+    stems = list(OrderedDict.fromkeys(c.stem for c in files))
+    if all(UI_FILE.search(c.path) and c.stem[:1].isupper() for c in files):
+        suffix = ' component' + ('s' if len(stems) > 1 else '')
+    elif all(c.category == 'style' for c in files):
+        suffix = ' styles'
+    elif all(c.category == 'test' for c in files):
+        return 'tests for ' + listing([re.sub(r'^test_|_test$', '', x) for x in stems], 3, budget - 10)
+    elif all(c.path.endswith('.py') for c in files):
+        suffix = ' module' + ('s' if len(stems) > 1 else '')
+    else:
+        suffix = ''
+        stems = [c.stem if c.category == 'source' else c.name for c in files]
+    return listing(stems, 3, budget - len(suffix)) + suffix
+
+
+def clauses_for(changes, dominant, convention, dep_add, dep_del, dep_bump, versions, budget):
+    """The subject's clauses, most important first; the caller keeps as many as fit."""
+    v = convention.verb
+    group = [c for c in changes if c.category == dominant] or changes
+    added = [c for c in group if c.status == 'A']
+    deleted = [c for c in group if c.status == 'D']
+    renamed = [c for c in group if c.status == 'R']
+    modified = [c for c in group if c.status == 'M']
+
+    if dominant == 'deps':
+        if versions and not (dep_add or dep_del or dep_bump):
+            return [f"{v('bump')} version from {versions[0][0]} to {versions[0][1]}"]
+        if len(dep_bump) == 1 and not dep_add and not dep_del:
+            n, old, new = dep_bump[0]
+            return [f"{v('bump')} {n} from {old} to {new}"]
+        out = []
+        if dep_add:
+            out.append(f"{v('add')} " + listing(dep_add, 3, budget - 18) + (' dependency' if len(dep_add) == 1 else ' dependencies'))
+        if dep_bump:
+            out.append(f"{v('bump')} " + listing([n for n, _, _ in dep_bump], 3, budget - 8))
+        if dep_del:
+            out.append(f"{v('remove')} " + listing(dep_del, 3, budget - 20) + (' dependency' if len(dep_del) == 1 else ' dependencies'))
+        return out or [f"{v('update')} dependencies"]
+    if dominant == 'docs':
+        verb = v('add') if added and not modified else v('remove') if deleted and not (added or modified) else v('update')
+        return [f'{verb} ' + listing([c.name for c in group], 2, budget - 8)]
+    if dominant == 'test':
+        target = listing([re.sub(r'^test_|_test$', '', c.stem) for c in group], 2, budget - 18)
+        return [(f"{v('add')} tests for " if added and not modified else f"{v('update')} tests for ") + target]
+    if dominant == 'ci':
+        return [f"{v('update')} CI: " + listing([c.name for c in group], 2, budget - 12)]
+
+    out = []
+    if added:
+        out.append(f"{v('add')} " + file_names(added, budget - 5))
+    if renamed:
+        if len(renamed) == 1:
+            out.append(f"{v('rename')} {os.path.basename(renamed[0].old_path)} to {renamed[0].name}")
+        else:
+            old_dirs, new_dirs = {os.path.dirname(c.old_path) for c in renamed}, {os.path.dirname(c.path) for c in renamed}
+            out.append(f"{v('move')} {len(renamed)} files from {old_dirs.pop() or '.'} to {new_dirs.pop() or '.'}"
+                       if len(old_dirs) == 1 and len(new_dirs) == 1 and old_dirs != new_dirs else f"{v('rename')} {len(renamed)} files")
+
+    new_syms, gone_syms, changed_syms = [], [], []
+    for c in sorted(modified, key=lambda c: -(c.added + c.removed)):
+        a, r, ch = c.symbols()
+        new_syms += [(n, k, c.path) for n, k in a.items()]
+        gone_syms += [(n, k, c.path) for n, k in r.items()]
+        changed_syms += [(n, k, c.path) for n, k in ch.items()]
+    for names in (new_syms, gone_syms, changed_syms):       # what a reader knows first: public names, then _helpers
+        names.sort(key=lambda item: item[0].startswith('_'))
+    where = f' in {group[0].name}' if len(group) == 1 and not convention.scope_mode == 'always' else ''
+    if new_syms:
+        out.append(f"{v('add')} " + named(new_syms, budget - 5 - len(where)) + (where if not added else ''))
+        where = ''
+    if changed_syms:
+        out.append(f"{v('update')} " + named(changed_syms, budget - 9 - len(where)) + where)
+        where = ''
+    elif modified and not new_syms:
+        plain = [c for c in modified if not any(c.symbols())]
+        if plain:
+            out.append(f"{v('update')} " + file_names(plain, budget - 9))
+    if gone_syms:
+        out.append(f"{v('remove')} " + named(gone_syms, budget - 8))
+    if deleted:
+        out.insert(0 if not (added or new_syms) else len(out), f"{v('remove')} " + file_names(deleted, budget - 8))
+    return out or [f"{v('update')} " + file_names(group, budget - 9)]
+
+
+def bullet(text):
+    return textwrap.fill(text, WRAP, initial_indent='- ', subsequent_indent='  ', break_long_words=False, break_on_hyphens=False)
+
+
+def label(name, kind):
+    return f'{name}()' if kind == 'fn' else name
+
+
+def file_line(c):
+    if c.status == 'A':
+        defined = [label(n, k) for n, k in sorted(c.symbols()[0].items(), key=lambda item: item[0].startswith('_'))][:4]
+        return f'{c.path}: new file' + (f' ({", ".join(defined)})' if defined else '')
+    if c.status == 'D':
+        return f'{c.path}: deleted'
+    if c.status == 'R':
+        return f'{c.path}: renamed from {c.old_path}' + (f', +{c.added} -{c.removed}' if c.added or c.removed else '')
+    if c.binary:
+        return f'{c.path}: binary file changed'
+    a, r, ch = c.symbols()
+    parts = []
+    if a:
+        parts.append('add ' + listing([label(n, k) for n, k in a.items()], 4))
+    if ch:
+        parts.append('update ' + listing([label(n, k) for n, k in ch.items()], 4))
+    if r:
+        parts.append('remove ' + listing([label(n, k) for n, k in r.items()], 4))
+    return f'{c.path}: ' + ('; '.join(parts) if parts else f'+{c.added} -{c.removed}')
+
+
+def compose(changes, branch, hint='', forced_type=None, body=None):
+    """The message. body: True / False to force a body, None = as this repository usually does."""
+    paths = [c.path for c in changes]
+    convention = Convention(paths, branch)
+    weights = Counter()
+    for c in changes:
+        if not LOCKS.search(c.path):
+            weights[c.category] += max(1, c.added + c.removed)
+    # Source decides when there is any: tests, docs, styles and config beside it are its company.
+    dominant = 'source' if weights.get('source') else (weights.most_common(1)[0][0] if weights else 'source')
+    details, dep_add, dep_del, dep_bump, versions = facts(changes)
+    kind = forced_type or type_of(changes, branch, hint, dominant, convention)
+    scope = scope_of([c for c in changes if c.category == dominant] or changes, convention)
+    head = convention.head(kind, scope)
+    room = convention.limit - len(head)
+    clauses = clauses_for(changes, dominant, convention, dep_add, dep_del, dep_bump, versions, room)
+    for other, _ in weights.most_common():          # tests, docs, dependencies beside the main change
+        if other != dominant and other in ('source', 'test', 'docs', 'deps', 'db', 'ci'):
+            clauses += clauses_for(changes, other, convention, dep_add, dep_del, dep_bump, versions, room)[:1]
+    if scope:      # the scope already names the file: "feat(LoginPage): update LoginPage component" says it twice
+        clauses = [re.sub(rf' in {re.escape(scope)}\.\w+$', '', c) for c in clauses]
+    phrase, verb = clauses[0], clauses[0].split(' ', 1)[0]
+    for extra in clauses[1:]:               # as many further clauses as the subject has room for
+        next_verb, _, rest = extra.partition(' ')
+        piece = ((', ' if ' and ' in rest or ' and ' in phrase else ' and ') + rest) if next_verb == verb else ('; ' + extra)
+        if len(phrase) + len(piece) > room:
+            break
+        phrase, verb = phrase + piece, next_verb
+    subject = head + convention.cased(phrase)
+    if len(subject) > convention.limit:
+        subject = subject[:convention.limit - 1].rsplit(' ', 1)[0].rstrip(',;:') + '…'
+
+    parts = []
+    if hint.strip():
+        parts.append(textwrap.fill(hint.strip(), WRAP))
+    listed = [c for c in sorted(changes, key=lambda c: (c.category != dominant, -(c.added + c.removed))) if not LOCKS.search(c.path)]
+    said_it_all = len(listed) == 1 and not details and (listed[0].status in ('A', 'D', 'R') or sum(map(len, listed[0].symbols())) <= 3)
+    want_body = body if body is not None else (convention.bodies and not said_it_all)
+    if want_body:
+        spelled = bool(dep_add or dep_del or dep_bump)
+        listed = [c for c in listed if not (spelled and MANIFESTS.search(c.path) and c.status == 'M')] or listed[:0]
+        lines = [bullet(file_line(c)) for c in listed[:14]]
+        if len(listed) > 14:
+            lines.append(bullet(f'and {len(listed) - 14} more files'))
+        if lines:
+            parts.append('\n'.join(lines))
+        extra = [bullet(f'{title}: {listing(values, 6)}') for title, values in details.items()]
+        if extra:
+            parts.append('\n'.join(extra))
+        locks = [c.name for c in changes if LOCKS.search(c.path)]
+        if locks:
+            parts.append(bullet('Lock file updated: ' + listing(locks, 3)))
+    return subject + ('\n\n' + '\n\n'.join(parts) if parts else '')
+
+
+# ── running it ───────────────────────────────────────────────────────────────
+
+def install_hook():
+    hooks = git('rev-parse', '--git-path', 'hooks').strip()
+    os.makedirs(hooks, exist_ok=True)
+    target = os.path.join(hooks, 'prepare-commit-msg')
+    me = os.path.abspath(__file__)
+    if os.path.exists(target) and 'smart-commit' not in open(target, errors='replace').read():
+        die(f'{target} already exists and is not ours. Add this line to it yourself:\n  "{me}" --hook "$1" "$2"')
+    with open(target, 'w') as handle:
+        handle.write(f'#!/bin/sh\n# Pre-fill the commit message with smart-commit. Remove this file to switch it off.\nexec "{me}" --hook "$1" "$2"\n')
+    os.chmod(target, 0o755)
+    print(f'Installed {target}: `git commit` now opens with the message filled in.', file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='smart-commit', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('-a', '--all', action='store_true', help='stage every change first')
+    parser.add_argument('-n', '--dry-run', action='store_true', help='only print the message')
+    parser.add_argument('-y', '--yes', action='store_true', help='commit without asking')
+    parser.add_argument('-p', '--push', action='store_true', help='push after committing')
+    parser.add_argument('-m', '--hint', default='', help='why the change was made, in your words')
+    parser.add_argument('-t', '--type', default=None, help='the commit type to use (feat, fix, refactor, ...)')
+    parser.add_argument('-b', '--body', dest='body', action='store_true', default=None, help='always write the per-file body')
+    parser.add_argument('-B', '--no-body', dest='body', action='store_false', help='subject line only')
+    parser.add_argument('--rev', default=None, help='print the message for an existing commit')
+    parser.add_argument('--install-hook', action='store_true', help='pre-fill `git commit` in this repository')
+    parser.add_argument('--hook', nargs='+', default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'], capture_output=True).returncode != 0:
+        die('not inside a git repository')
+    os.chdir(git('rev-parse', '--show-toplevel').strip())
+    if args.install_hook:
+        return install_hook()
+
+    hook_file = None
+    if args.hook:
+        hook_file, source = args.hook[0], (args.hook[1] if len(args.hook) > 1 else '')
+        if source:            # -m / -F, a merge, a squash, an amend or a template: leave it alone
+            return
+        args.dry_run = True
+
+    branch = git('rev-parse', '--abbrev-ref', 'HEAD', check=False).strip()
+    common = ['-M', '-U0', '--no-color', '--no-ext-diff']
+    if args.rev:
+        diff = git('show', '--format=', *common, args.rev)
+        args.dry_run = True
+    else:
+        if args.all:
+            git('add', '-A')
+        staged = subprocess.run(['git', 'diff', '--cached', '--quiet']).returncode != 0
+        if not staged:
+            if not git('status', '--porcelain').strip():
+                if hook_file:
+                    return
+                die('nothing to commit: the working tree is clean')
+            if args.dry_run:
+                git('add', '-A', '-N', check=False)        # so new files show in the diff (intent only)
+                print('Nothing is staged: describing every change in the working tree.', file=sys.stderr)
+                diff = git('diff', *common)
+            elif args.yes:
+                die('nothing is staged (use -a to stage everything)')
+            else:
+                answer = input('Nothing is staged. Stage every change (git add -A)? [y/N] ').strip().lower()
+                if answer not in ('y', 'yes'):
+                    die('nothing staged, nothing done')
+                git('add', '-A')
+                diff = git('diff', '--cached', *common)
+        else:
+            diff = git('diff', '--cached', *common)
+
+    changes = parse(diff)
+    if not changes:
+        die('no changes found to describe')
+    message = compose(changes, branch, args.hint, args.type, args.body)
+
+    if hook_file:
+        rest = open(hook_file, errors='replace').read()
+        with open(hook_file, 'w') as handle:
+            handle.write(message + '\n' + rest)
+        return
+    if args.dry_run:
+        print(message)
+        return
+
+    def commit(edit=False):
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as handle:
+            handle.write(message + '\n')
+        try:
+            done = subprocess.run(['git', 'commit', '-F', handle.name, *(['-e'] if edit else ['-q'])])
+        finally:
+            os.unlink(handle.name)
+        if done.returncode != 0:
+            sys.exit(done.returncode)
+        print('Committed ' + git('log', '-1', '--pretty=%h %s').strip(), file=sys.stderr)
+        if args.push:
+            sys.exit(subprocess.run(['git', 'push']).returncode)
+
+    if args.yes:
+        return commit()
+    print('\n' + message + '\n')
+    choice = input('[c]ommit  [e]dit  [q]uit ? ').strip().lower()
+    if choice in ('', 'c', 'y'):
+        commit()
+    elif choice == 'e':
+        commit(edit=True)
+    else:
+        print('Nothing committed. What is staged stays staged.', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        sys.exit(130)
