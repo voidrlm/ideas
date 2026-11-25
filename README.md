@@ -1,43 +1,112 @@
+<div align="center">
+
+<img src="io.github.voidrlm.Ideas.svg" width="112" alt="Ideas icon">
+
 # Ideas
 
-Simple lists of ideas and to-dos for GNOME, built with GTK 4 and libadwaita — with images and a
-one-click hand-off to Claude Code.
+**A to-do list for GNOME that hands your tasks to Claude Code.**
 
-- **Lists** with colors. Tick to-dos off; show or clear completed ones per list. Search all lists.
-- **Quick add:** type and press Enter. `!`, `!!`, `!!!` set the priority; `#ListName` files it in
-  another list.
-- **Notes and images:** paste screenshots or copied images/files with `Ctrl+V` (into the add box,
-  onto a selected to-do, or in its details), drag and drop them, or add them from a folder.
-- **Folder-linked lists → Claude Code:** link a project folder to a list (Edit List…). Each to-do
-  then gets a **Send to Claude Code** button (the Claude logo) that opens a terminal in that folder and runs
-  `claude` with the to-do as the prompt. Its images go too: their paths are in the prompt and the
-  image folder is passed with `--add-dir`, so Claude can open them without asking. The list menu
-  can send all open to-dos at once. While Claude works the to-do shows a spinner by the Claude logo;
-  when Claude finishes its reply (a `Stop` hook passed with `--settings`) it is marked done, with
-  Undo in the toast. If Claude Code is closed before it finishes, the to-do stays open. Sessions
-  that finish while Ideas is closed are picked up the next time it opens.
-- **Tasks from Microsoft Teams:** the button at the top of the sidebar (`Ctrl+T`) reads your unread
-  Teams chats and adds the things you've been asked to do to a **Teams** list, with who asked and
-  the original message in the notes. Chats are **not** marked as read. See below.
-- **Commit and push:** a list whose folder has uncommitted (or unpushed) work shows a push button
-  in the sidebar. It lists what changed, then commits everything with a message written by
-  [`smart-commit`](#commit-and-push) and pushes. A folder that holds several repositories (say a
-  backend and a frontend) is handled in one go.
-- Undo for deletes and completions, keyboard shortcuts (`Ctrl+?`).
+Jot down ideas and to-dos, attach screenshots, link a list to a project folder, and send any task
+to [Claude Code](https://claude.com/claude-code) with one click. It's ticked off when Claude is done.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![GTK 4 + libadwaita](https://img.shields.io/badge/GTK%204-libadwaita-4a86cf)
+![Linux](https://img.shields.io/badge/platform-Linux-informational)
+[![Latest release](https://img.shields.io/github/v/release/voidrlm/ideas)](https://github.com/voidrlm/ideas/releases)
+
+[Install](#install) · [Features](#features) · [Claude Code](#send-to-claude-code) · [Keyboard](#keyboard-and-command-line) · [FAQ](#faq)
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/ideas-dark.png">
+  <img src="screenshots/ideas.png" alt="Ideas showing a project list linked to a folder, with priorities, notes, an attached image and a task Claude Code is working on" width="860">
+</picture>
+
+</div>
 
 ## Install
 
-Requires Python 3, PyGObject, GTK 4 and libadwaita 1.8 or newer.
+Paste this into a terminal:
 
 ```sh
-# Fedora
-sudo dnf install python3-gobject gtk4 libadwaita
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/voidrlm/ideas/main/install.sh | bash
 ```
 
-This adds `ideas` to `~/.local/bin` and an entry to the app grid.
+That's it. Ideas appears in your app grid. The installer:
 
-## Usage
+- installs the few system packages it needs (it asks for your password once),
+- puts the app in `~/.local/opt/ideas` and adds a launcher. Nothing is installed system-wide,
+- can be run again at any time to update to the latest release.
+
+**Runs on:** Fedora 43+, Ubuntu 25.10+, Arch Linux and other distributions with libadwaita 1.8 or newer.
+
+<details>
+<summary>Other ways to install</summary>
+
+**From a clone** (handy if you want to hack on it — the app runs straight from the folder):
+
+```sh
+git clone https://github.com/voidrlm/ideas.git
+cd ideas && ./install.sh
+```
+
+**By hand:** install Python 3, PyGObject, GTK 4 and libadwaita ≥ 1.8, then run `./ideas`.
+
+| Distribution | Packages |
+|---|---|
+| Fedora | `sudo dnf install python3-gobject gtk4 libadwaita git` |
+| Ubuntu / Debian | `sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 git` |
+| Arch | `sudo pacman -S python-gobject gtk4 libadwaita git` |
+
+</details>
+
+## Features
+
+- **Lists with colours.** Tick to-dos off; show or clear completed ones per list; search everything.
+- **Fast capture.** Type and press <kbd>Enter</kbd>. `!`, `!!` or `!!!` set the priority, and `#ListName` files the to-do in another list.
+- **Notes and images.** Paste screenshots with <kbd>Ctrl</kbd>+<kbd>V</kbd>, drag and drop images, or add them from a folder.
+- **Send to Claude Code.** Link a list to a project folder and every to-do gets a Claude button. [More below](#send-to-claude-code).
+- **Commit and push.** A list whose folder has uncommitted work shows a push button. It commits with a generated message and pushes, even across several repositories in one folder.
+- **Tasks from Microsoft Teams** (optional). Pulls the things people asked you to do in unread Teams chats into a list, without marking anything as read. [More below](#tasks-from-microsoft-teams).
+- **Undo** for deletes and completions, and a full set of keyboard shortcuts.
+- **Private.** Everything is kept in one JSON file on your computer. No account, no cloud, no tracking.
+
+## Send to Claude Code
+
+1. Open a list's menu → **Edit List…** and pick a project folder.
+2. Each to-do in that list now has a round Claude button. Click it and a terminal opens in the
+   folder with `claude` already working on the to-do: its title, notes and any attached images.
+3. While Claude works, the to-do shows a spinner. When Claude finishes its reply, the to-do is
+   ticked off, with **Undo** in case you want another round.
+
+Use the list menu to send all open to-dos at once. If you close Claude Code before it finishes, the
+to-do simply stays open. Sessions that finish while Ideas is closed are picked up the next time it opens.
+
+This needs the [`claude`](https://claude.com/claude-code) command and a terminal: Ptyxis, GNOME Terminal,
+Console, kitty, foot, WezTerm, Alacritty, Konsole or xterm.
+
+## Commit and push
+
+When a list's folder has uncommitted (or unpushed) work, a push button appears in the sidebar. It shows
+what changed, then commits everything with a message written by the bundled
+[`smart-commit`](smart-commit) script, in the repository's own commit style, and runs `git push`. A folder
+holding several repositories, say a backend and a frontend, is handled in one go. If a push fails, the
+commit is kept and the button pushes it next time.
+
+`smart-commit` works on its own from a terminal too: `./smart-commit --help`.
+
+## Tasks from Microsoft Teams
+
+Press the button at the top of the sidebar (<kbd>Ctrl</kbd>+<kbd>T</kbd>). Ideas reads your **unread**
+Teams chats and adds the things you've been asked to do to a **Teams** list, with who asked and the
+original message in the notes.
+
+- **Nothing changes in Teams.** Chats stay unread. Ideas reads them with plain GET requests and keeps its own note of how far it has looked.
+- **No Azure app or admin consent needed.** A private Chromium (Playwright) signs in to Teams on the web once, in a window, and then runs unseen. It is set up automatically in `~/.local/share/ideas/teams-venv`.
+- **Claude Code decides what counts as a task.** New messages are passed to `claude -p` with no tools allowed. This uses your own Claude Code sign-in.
+
+## Keyboard and command line
+
+Press <kbd>Ctrl</kbd>+<kbd>?</kbd> in the app for every shortcut.
 
 ```sh
 ideas                                 # open the window
@@ -45,40 +114,36 @@ ideas --add "Try a dark theme !!"     # add a to-do without opening the window
 ideas --new                           # open with the add box focused
 ```
 
-The Claude Code and Teams options need the `claude` command; sending to Claude Code also needs a
-terminal (Ptyxis, GNOME Terminal, Console, kitty, foot, WezTerm, Alacritty, Konsole or xterm).
+Tip: bind `ideas --new` to a keyboard shortcut in GNOME Settings to capture an idea from anywhere.
 
-## Teams
+## FAQ
 
-No Azure app or admin consent is involved: Ideas drives a private Chromium (Playwright) that is
-signed in to Teams web, the way you would be in a browser. The first check sets this up by itself
-(a virtualenv with Playwright in `~/.local/share/ideas/teams-venv`, the sign-in in
-`teams-profile` next to it) and asks you to sign in once in a window; after that it runs unseen.
+**Where is my data?**
+In `~/.local/share/ideas/data.json`, saved after every change, with attached images in `images/` next
+to it. Back up that folder to keep everything. Set `IDEAS_DATA=/path/to/file.json` to use another file.
 
-- **Nothing in Teams changes.** Normally Teams' own code doesn't even run: the chats are read with
-  plain GET requests from a blank page. When the sign-in needs renewing, Teams is loaded briefly
-  with every request that could change anything refused. Ideas keeps its own bookmark of how far
-  it has looked in each chat, so a message is only considered once while staying unread in Teams.
-- **Claude Code decides what is a task.** The new unread messages (with a little of the
-  conversation around them) are passed to `claude -p`, with no tools, which returns the to-dos.
-  This uses your Claude Code sign-in; nothing else leaves the machine.
-- Run it by hand to see what it does: `echo '{}' | python3 ideas_teams.py --data-dir
-  ~/.local/share/ideas --debug --dry-run` prints the chats it would look at.
+**Do I need Claude Code?**
+No. Ideas is a complete to-do app on its own. The Claude button only appears on lists you link to a folder.
 
-## Commit and push
+**Does it have due dates or notifications?**
+No, on purpose. Ideas is for capturing and working through ideas, not for nagging you.
 
-The push button runs the bundled `smart-commit -a -y` in each repository with uncommitted changes
-(it stages everything and writes the message from the diff, in the repository's own commit
-style), then `git push` (setting the upstream for a new branch). A commit whose push fails stays
-committed; the button remains and only pushes next time.
+**How do I uninstall it?**
 
-`smart-commit` is a standalone script and works from a terminal too: `./smart-commit --help`.
+```sh
+curl -fsSL https://raw.githubusercontent.com/voidrlm/ideas/main/install.sh | bash -s -- --uninstall
+```
 
-## Data
+Your lists are kept in `~/.local/share/ideas` unless you delete that folder.
 
-Everything is stored in `~/.local/share/ideas/data.json`, saved after every change. Attached
-images are kept next to it in `images/`; images no to-do uses any more are removed the next time
-the app starts. Set `IDEAS_DATA=/path/to/file.json` to use another file.
+## Contributing
 
-Data from the app's earlier name, Reminders (`~/.local/share/reminders`), is moved over
-automatically the first time Ideas starts.
+Bug reports and pull requests are welcome. Ideas is plain Python with no build step:
+`ideas_core.py` holds the data model (no GTK), `ideas.py` the interface, `ideas_git.py` the
+commit-and-push feature and `ideas_teams.py` the Teams reader. Run `./ideas` from a clone to try your changes.
+
+If Ideas is useful to you, please ⭐ **star the repo**. It helps other people find it.
+
+## License
+
+[MIT](LICENSE)
