@@ -64,7 +64,7 @@ cd ideas && ./install.sh
 - **Lists with colours.** Tick to-dos off; show or clear completed ones per list; search everything.
 - **Fast capture.** Type and press <kbd>Enter</kbd>. `!`, `!!` or `!!!` set the priority, and `#ListName` files the to-do in another list.
 - **Notes and images.** Paste screenshots with <kbd>Ctrl</kbd>+<kbd>V</kbd>, drag and drop images, or add them from a folder.
-- **Send to Claude Code.** Link a list to a project folder and every to-do gets a Claude button. [More below](#send-to-claude-code).
+- **Send to Claude Code, Codex or OpenRouter.** Link a list to a project folder and every to-do gets a button for each coding agent you have. [More below](#send-to-claude-code).
 - **Commit and push.** A list whose folder has uncommitted work shows a push button. It commits with a generated message and pushes, even across several repositories in one folder.
 - **Tasks from Microsoft Teams** (optional). Pulls the things people asked you to do in unread Teams chats into a list, without marking anything as read. [More below](#tasks-from-microsoft-teams).
 - **Tasks from Gmail and Outlook** (optional). The same for your unread email. [More below](#tasks-from-gmail-and-outlook).
@@ -78,6 +78,21 @@ cd ideas && ./install.sh
    folder with `claude` already working on the to-do: its title, notes and any attached images.
 3. While Claude works, the to-do shows a spinner. When Claude finishes its reply, the to-do is
    ticked off, with **Undo** in case you want another round.
+
+### Codex and OpenRouter
+
+Ideas shows a button for every agent it finds, next to the Claude one:
+
+| Button | Shown when | Runs |
+|---|---|---|
+| **Claude Code** | the `claude` command is installed | `claude` |
+| **Codex** | the `codex` command is installed | `codex`, with the to-do's images attached |
+| **OpenRouter** | `claude` is installed and `OPENROUTER_API_KEY` is set (in your environment or `~/.profile`) | Claude Code using OpenRouter as its model provider |
+
+All of them work the same way: a terminal opens in the folder, a spinner shows while the agent works,
+and the to-do is ticked off when it finishes its reply. To pick the OpenRouter model, set
+`IDEAS_OPENROUTER_MODEL`, for example `export IDEAS_OPENROUTER_MODEL=openai/gpt-5` in `~/.profile`;
+otherwise OpenRouter's default for Claude Code is used. Your OpenRouter key is read in the terminal and never put on a command line.
 
 Use the list menu to send all open to-dos at once. If you close Claude Code before it finishes, the
 to-do simply stays open. Sessions that finish while Ideas is closed are picked up the next time it opens.
