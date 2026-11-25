@@ -15,7 +15,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
 import reminders_core as core  # noqa: E402
 
@@ -55,6 +56,10 @@ def build_css():
     .color-choice { min-width: 26px; min-height: 26px; padding: 0; border-radius: 99px; }
     .color-choice:checked { box-shadow: 0 0 0 2px var(--window-bg-color), 0 0 0 4px var(--window-fg-color); }
     row.item-row { padding: 0; }
+    .thumb { border-radius: 8px; }
+    .thumb-more { font-size: 0.8em; font-weight: bold; }
+    .image-remove { min-width: 24px; min-height: 24px; padding: 0; margin: 4px; }
+    .image-tile { padding: 0; border-radius: 10px; }
     """
     for name, hexc in core.COLORS:
         css += f"""
@@ -131,8 +136,11 @@ TERMINALS = [
 ]
 
 
-def launch_claude(folder, prompt):
-    """Open a terminal in `folder` running Claude Code with `prompt`.  Returns an error or None."""
+def launch_claude(folder, prompt, extra_dirs=()):
+    """Open a terminal in `folder` running Claude Code with `prompt`.  Returns an error or None.
+
+    extra_dirs (e.g. where attached images live) are passed with --add-dir so Claude can read them.
+    """
     if not folder or not os.path.isdir(folder):
         return "The linked folder doesn't exist any more"
     claude = find_claude()
@@ -141,16 +149,138 @@ def launch_claude(folder, prompt):
     term = next(((shutil.which(t), args) for t, args in TERMINALS if shutil.which(t)), None)
     if not term:
         return "No terminal app found"
-    if prompt.startswith("-"):
-        prompt = " " + prompt   # so claude doesn't read it as a command-line option
+    argv = [claude]
+    for d in extra_dirs:
+        argv += ["--add-dir", d]
+    argv += ["--", prompt]      # "--" ends options: --add-dir takes several values, and prompts may start with "-"
     # After Claude exits, stay in a shell in that folder instead of closing the window.
-    script = 'cd "$1" || exit 1; "$2" "$3"; exec "${SHELL:-bash}" -l'
-    cmd = [term[0], *term[1], "bash", "-lc", script, "claude-code", folder, claude, prompt]
+    script = 'cd "$1" || exit 1; shift; "$@"; exec "${SHELL:-bash}" -l'
+    cmd = [term[0], *term[1], "bash", "-lc", script, "claude-code", folder, *argv]
     try:
         spawn(cmd, cwd=folder)
     except GLib.Error as e:
         return f"Couldn't open the terminal: {e.message}"
     return None
+
+
+# ---------------------------------------------------------------- images
+
+_thumb_cache = {}
+
+
+def thumb_texture(path, size):
+    """A square, center-cropped texture of the image, cached by file and size."""
+    try:
+        key = (path, size, os.path.getmtime(path))
+    except OSError:
+        return None
+    tex = _thumb_cache.get(key)
+    if tex is None:
+        try:
+            _fmt, w, h = GdkPixbuf.Pixbuf.get_file_info(path)
+            target = size * 2  # sharp on HiDPI
+            scale = min(1.0, max(target / max(w, 1), target / max(h, 1)))
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, max(1, int(w * scale)), max(1, int(h * scale)), False)
+            pb = pb.apply_embedded_orientation() or pb
+            side = min(pb.get_width(), pb.get_height())
+            pb = pb.new_subpixbuf((pb.get_width() - side) // 2, (pb.get_height() - side) // 2, side, side).copy()
+        except (GLib.Error, TypeError):
+            return None
+        fmt = Gdk.MemoryFormat.R8G8B8A8 if pb.get_has_alpha() else Gdk.MemoryFormat.R8G8B8
+        tex = Gdk.MemoryTexture.new(pb.get_width(), pb.get_height(), fmt, pb.read_pixel_bytes(), pb.get_rowstride())
+        _thumb_cache[key] = tex
+    return tex
+
+
+def thumb_picture(path, size):
+    """A size×size rounded thumbnail (Gtk.Image keeps an exact size, unlike Gtk.Picture)."""
+    tex = thumb_texture(path, size)
+    img = Gtk.Image(pixel_size=size, css_classes=["thumb"], valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+    img.set_overflow(Gtk.Overflow.HIDDEN)
+    if tex:
+        img.set_from_paintable(tex)
+    else:
+        img.set_from_icon_name("image-missing-symbolic")
+    return img
+
+
+def save_texture(store, texture):
+    name = store.new_image_name(".png")
+    texture.save_to_png(store.image_path(name))
+    return name
+
+
+def import_image_file(store, gfile):
+    """Copy an image file into the store; returns its new name, or None if it isn't an image."""
+    path = gfile.get_path()
+    ext = os.path.splitext(gfile.get_basename() or "")[1].lower()
+    try:
+        if ext in core.IMAGE_EXTS:
+            name = store.new_image_name(".jpg" if ext == ".jpeg" else ext)
+            data = gfile.load_bytes(None)[0].get_data()
+            with open(store.image_path(name), "wb") as f:
+                f.write(data)
+            return name
+        if not path:
+            return None
+        pb = GdkPixbuf.Pixbuf.new_from_file(path)       # HEIC, BMP, TIFF, AVIF… → PNG
+        pb = pb.apply_embedded_orientation() or pb
+        name = store.new_image_name(".png")
+        pb.savev(store.image_path(name), "png", [], [])
+        return name
+    except (GLib.Error, OSError):
+        return None
+
+
+def import_value(store, value):
+    """Names of images saved from a dropped/pasted Gdk.Texture or Gdk.FileList."""
+    if isinstance(value, Gdk.Texture):
+        return [save_texture(store, value)]
+    if isinstance(value, Gdk.FileList):
+        return [n for n in (import_image_file(store, f) for f in value.get_files()) if n]
+    return []
+
+
+def clipboard_has_image(clipboard):
+    """True when Ctrl+V should attach an image instead of pasting text."""
+    fmts = clipboard.get_formats()
+    if fmts.contain_gtype(Gdk.FileList.__gtype__):
+        return True
+    # Office apps put a picture of copied text on the clipboard too; prefer the text then.
+    return fmts.contain_gtype(Gdk.Texture.__gtype__) and not fmts.contain_mime_type("text/plain")
+
+
+def read_clipboard_images(store, clipboard, done):
+    """Read pasted images and call done(names)."""
+    fmts = clipboard.get_formats()
+    if fmts.contain_gtype(Gdk.FileList.__gtype__):
+        def got_files(cb, res):
+            try:
+                value = cb.read_value_finish(res)
+            except GLib.Error:
+                value = None
+            done(import_value(store, value) if value is not None else [])
+        clipboard.read_value_async(Gdk.FileList.__gtype__, GLib.PRIORITY_DEFAULT, None, got_files)
+    else:
+        def got_texture(cb, res):
+            try:
+                tex = cb.read_texture_finish(res)
+            except GLib.Error:
+                tex = None
+            done([save_texture(store, tex)] if tex else [])
+        clipboard.read_texture_async(None, got_texture)
+
+
+def image_drop_target(on_drop):
+    """A drop target accepting image files and raw images; on_drop(value, x, y) -> bool."""
+    target = Gtk.DropTarget.new(GObject.TYPE_NONE, Gdk.DragAction.COPY)
+    target.set_gtypes([Gdk.FileList.__gtype__, Gdk.Texture.__gtype__])
+    target.connect("drop", lambda _t, value, x, y: on_drop(value, x, y))
+    return target
+
+
+def open_image(path, parent):
+    Gtk.FileLauncher.new(Gio.File.new_for_path(path)).launch(parent, None)
 
 
 def color_dot(color, size=12):
@@ -290,7 +420,8 @@ class RemindersApp(Adw.Application):
             body.append(item["notes"].strip()[:200])
         n.set_body("\n".join(body) or None)
         n.set_priority(Gio.NotificationPriority.HIGH)
-        n.set_icon(Gio.ThemedIcon.new(APP_ID))
+        img = next((self.store.image_path(x) for x in item["images"] if os.path.exists(self.store.image_path(x))), None)
+        n.set_icon(Gio.FileIcon.new(Gio.File.new_for_path(img)) if img else Gio.ThemedIcon.new(APP_ID))
         target = GLib.Variant("s", item["id"])
         n.set_default_action_and_target("app.open-item", target)
         n.add_button_with_target("Mark as Done", "app.complete", target)
@@ -333,10 +464,12 @@ class RemindersApp(Adw.Application):
 
     # -- shared actions
 
-    def quick_add(self, text, view):
+    def quick_add(self, text, view, images=()):
         """Add a reminder typed in the quick-add box (or --add) to `view`."""
         s = self.store
-        fields = {}
+        fields = {"images": list(images)}
+        if not text.strip() and images:
+            text = "Image" if len(images) == 1 else "Images"
         list_id = view[1] if view[0] == "list" else None
         title = text.strip()
         if s.settings["smart_parse"]:
@@ -421,11 +554,104 @@ class MainWindow(Adw.ApplicationWindow):
         self._build_actions()
         self._build_sidebar()
         self._build_content()
+        self.pending_images = []
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(keys)
+        self.scroller.add_controller(image_drop_target(self._on_drop_list))
+        self.quick_box.add_controller(image_drop_target(lambda v, x, y: self._stage_images(import_value(self.store, v))))
+
         self.store.connect(self._on_store_changed)
         self.connect("close-request", self._on_close_request)
         self.refresh()
 
+    # -- pasting and dropping images
+
+    def _on_key_pressed(self, _ctl, keyval, _code, state):
+        if keyval not in (Gdk.KEY_v, Gdk.KEY_V) or not state & Gdk.ModifierType.CONTROL_MASK:
+            return False
+        clipboard = self.get_clipboard()
+        if not clipboard_has_image(clipboard):
+            return False                     # ordinary text paste
+        dialog = self.get_visible_dialog()
+        if isinstance(dialog, ItemDialog):
+            read_clipboard_images(self.store, clipboard, dialog.attach)
+            return True
+        if dialog is not None:
+            return False
+        row = self._focused_item_row()
+        if row is not None:
+            item_id = row.item_id
+            read_clipboard_images(self.store, clipboard, lambda names: self._attach(item_id, names))
+        else:
+            if self.view == ("smart", "completed"):
+                self.select_view(("smart", "today"))
+            read_clipboard_images(self.store, clipboard, self._stage_images)
+        return True
+
+    def _focused_item_row(self):
+        w = self.get_focus()
+        while w is not None:
+            if isinstance(w, Gtk.ListBoxRow) and hasattr(w, "item_id"):
+                return w
+            if w is self.quick_entry:
+                return None
+            w = w.get_parent()
+        return None
+
+    def _attach(self, item_id, names):
+        if not names:
+            self.toast("No image found to attach")
+            return
+        self.store.add_images(item_id, names)
+        it = self.store.get_item(item_id)
+        self.toast(f"Attached {len(names)} image{'s' if len(names) > 1 else ''} to “{it['title']}”")
+
+    def _on_drop_list(self, value, x, y):
+        w = self.scroller.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while w is not None and not (isinstance(w, Gtk.ListBoxRow) and hasattr(w, "item_id")):
+            w = w.get_parent()
+        names = import_value(self.store, value)
+        if w is not None:
+            self._attach(w.item_id, names)
+        else:
+            self._stage_images(names)
+        return bool(names)
+
+    def _stage_images(self, names):
+        """Images pasted into the add box wait there until the reminder is added."""
+        if not names:
+            self.toast("No image found to attach")
+            return
+        self.pending_images += names
+        self._sync_pending()
+        self.split.set_show_content(True)
+        self.quick_entry.grab_focus()
+
+    def _clear_pending(self, discard=True):
+        if discard:
+            for n in self.pending_images:
+                self.store.discard_image_file(n)
+        self.pending_images = []
+        self._sync_pending()
+
+    def _sync_pending(self):
+        box = self.pending_box
+        while box.get_first_child():
+            box.remove(box.get_first_child())
+        for n in self.pending_images:
+            box.append(thumb_picture(self.store.image_path(n), 36))
+        if self.pending_images:
+            box.append(Gtk.Label(label=f"{len(self.pending_images)} image{'s' if len(self.pending_images) > 1 else ''}"
+                                       " — type a title and press Enter", css_classes=["dim-label"]))
+            x = Gtk.Button(icon_name="window-close-symbolic", css_classes=["flat", "circular"],
+                           tooltip_text="Remove images", valign=Gtk.Align.CENTER)
+            x.connect("clicked", lambda *_: self._clear_pending())
+            box.append(x)
+        box.set_visible(bool(self.pending_images))
+
     def _on_close_request(self, _win):
+        self._clear_pending()
         st = self.store.settings
         st["window_maximized"] = self.is_maximized()
         if not self.is_maximized():
@@ -639,6 +865,8 @@ class MainWindow(Adw.ApplicationWindow):
                        margin_start=12, margin_end=12)
         qbox.append(self.quick_entry)
         qbox.append(self.quick_preview)
+        self.pending_box = Gtk.Box(spacing=8, margin_top=6, margin_start=6, visible=False)
+        qbox.append(self.pending_box)
         self.quick_box = Adw.Clamp(maximum_size=720, child=qbox)
         body.append(self.quick_box)
 
@@ -690,10 +918,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_quick_add(self, entry):
         text = entry.get_text().strip()
-        if not text:
+        if not text and not self.pending_images:
             return
         view = self.view if self.view != ("smart", "completed") else ("smart", "all")
-        item = self.app.quick_add(text, view)
+        item = self.app.quick_add(text, view, self.pending_images)
+        self._clear_pending(discard=False)
         entry.set_text("")
         # If the new reminder doesn't belong in this view (e.g. #otherlist), say where it went.
         if not any(it["id"] == item["id"] for _h, its in self.store.sections(self.view, dt.datetime.now(), True)
@@ -856,6 +1085,13 @@ class MainWindow(Adw.ApplicationWindow):
             if not text.get_last_child() is meta:
                 text.append(meta)
 
+        if it["images"]:
+            tb = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+            tb.append(thumb_picture(self.store.image_path(it["images"][0]), 40))
+            if len(it["images"]) > 1:
+                tb.append(Gtk.Label(label=f"+{len(it['images']) - 1}", css_classes=["thumb-more", "dim-label"]))
+            tb.set_tooltip_text(f"{len(it['images'])} image{'s' if len(it['images']) > 1 else ''}")
+            box.append(tb)
         if it["flagged"]:
             box.append(Gtk.Image(icon_name="starred-symbolic", css_classes=["flag-mark"], valign=Gtk.Align.CENTER,
                                  tooltip_text="Flagged"))
@@ -939,7 +1175,9 @@ class MainWindow(Adw.ApplicationWindow):
         if not lst or not lst.get("folder"):
             self.toast("Link a folder to this list first (Edit List…)")
             return
-        err = launch_claude(lst["folder"], core.claude_prompt(items, lst["name"]))
+        has_images = any(it["images"] for it in items)
+        err = launch_claude(lst["folder"], core.claude_prompt(items, lst["name"], self.store.image_path),
+                            [self.store.images_dir] if has_images else ())
         if err:
             self.toast(err)
             return
@@ -1152,6 +1390,18 @@ class ItemDialog(Adw.Dialog):
         page.add(gn)
 
         # Date & time
+        self.images_group = Adw.PreferencesGroup(
+            title="Images", description="Paste with Ctrl+V, drop image files here, or add from a folder.")
+        add_img = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER,
+                             tooltip_text="Add Images…")
+        add_img.connect("clicked", self._pick_images)
+        self.images_group.set_header_suffix(add_img)
+        self.images_flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=8, row_spacing=8,
+                                       max_children_per_line=4, min_children_per_line=2, homogeneous=True)
+        self.images_group.add(self.images_flow)
+        page.add(self.images_group)
+        tv.add_controller(image_drop_target(lambda v, x, y: bool(self.attach(import_value(self.store, v))) or True))
+
         gd = Adw.PreferencesGroup(title="Date &amp; Time")
         self.date_row = Adw.ExpanderRow(title="Date", show_enable_switch=True, enable_expansion=bool(due_d),
                                         expanded=False)
@@ -1234,6 +1484,7 @@ class ItemDialog(Adw.Dialog):
         page.add(gx)
 
         self._ready = True
+        self._refresh_images()
         self._sync_subtitles()
         self.connect("closed", self._apply)
 
@@ -1294,6 +1545,57 @@ class ItemDialog(Adw.Dialog):
         self.repeat_row.set_sensitive(has_date)
 
     # -- save
+
+    # -- images
+
+    def attach(self, names):
+        if names:
+            self.store.add_images(self.item_id, names)
+            self._refresh_images()
+        else:
+            self.win.toast("No image found to attach")
+        return names
+
+    def _refresh_images(self):
+        flow = self.images_flow
+        while flow.get_first_child():
+            flow.remove(flow.get_first_child())
+        item = self.store.get_item(self.item_id)
+        names = item["images"] if item else []
+        for n in names:
+            path = self.store.image_path(n)
+            tile = Gtk.Button(css_classes=["flat", "image-tile"], tooltip_text="Open image")
+            pic = thumb_picture(path, 96)
+            tile.set_child(pic)
+            tile.connect("clicked", lambda *_a, p=path: open_image(p, self.win))
+            overlay = Gtk.Overlay(child=tile)
+            rm = Gtk.Button(icon_name="window-close-symbolic", css_classes=["osd", "circular", "image-remove"],
+                            halign=Gtk.Align.END, valign=Gtk.Align.START, tooltip_text="Remove image")
+            rm.connect("clicked", lambda *_a, name=n: self._remove_image(name))
+            overlay.add_overlay(rm)
+            flow.append(overlay)
+        flow.set_visible(bool(names))
+
+    def _remove_image(self, name):
+        self.store.remove_image(self.item_id, name)
+        self._refresh_images()
+
+    def _pick_images(self, *_):
+        filt = Gtk.FileFilter(name="Images")
+        filt.add_pixbuf_formats()
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(filt)
+        fd = Gtk.FileDialog(title="Add Images", filters=filters, default_filter=filt)
+
+        def picked(dlg, res):
+            try:
+                files = dlg.open_multiple_finish(res)
+            except GLib.Error:
+                return
+            names = [n for n in (import_image_file(self.store, files.get_item(i))
+                                 for i in range(files.get_n_items())) if n]
+            self.attach(names)
+        fd.open_multiple(self.win, None, picked)
 
     def _sync_claude(self):
         lst = self.store.lists[min(self.list_row.get_selected(), len(self.store.lists) - 1)]

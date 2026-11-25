@@ -13,6 +13,10 @@ A to-do list and reminders app for GNOME, built with GTK 4 and libadwaita.
   to-do then gets a **Send to Claude Code** button that opens a terminal in that folder and
   runs `claude` with the to-do (title and notes) as the prompt. The list menu can send all
   open to-dos at once.
+- **Images:** paste screenshots or copied images/files with `Ctrl+V` (into the add box, onto a
+  selected to-do, or in its details), drag and drop them, or add them from a folder. When a to-do
+  is sent to Claude Code its images go too: their paths are in the prompt and the image folder is
+  passed with `--add-dir`, so Claude can open them without asking.
 - Search, notes, undo for deletes and completions, keyboard shortcuts (`Ctrl+?`).
 
 ## Install
@@ -45,4 +49,6 @@ Console, kitty, foot, WezTerm, Alacritty, Konsole or xterm).
 ## Data
 
 Everything is stored in `~/.local/share/reminders/data.json`, saved after every change.
+Attached images are kept next to it in `~/.local/share/reminders/images/`; images no reminder
+uses any more are removed the next time the app starts.
 Set `REMINDERS_DATA=/path/to/file.json` to use another file.

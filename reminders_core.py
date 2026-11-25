@@ -65,7 +65,10 @@ ITEM_DEFAULTS = {
     "alerted": None,          # alert_key() of the last alert sent (or skipped)
     "snooze_until": None,     # "YYYY-MM-DDTHH:MM"
     "claude_sent_at": None,   # last time it was sent to Claude Code
+    "images": (),             # file names in Store.images_dir (always replaced, never mutated)
 }
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
 def new_id():
@@ -435,18 +438,32 @@ def parse_quick(text, now, list_names=()):
 # ---------------------------------------------------------------- Claude Code
 
 
-def claude_prompt(items, list_name=None):
-    """The prompt sent to Claude Code for one to-do, or for several from a list."""
-    def one(it):
-        notes = it["notes"].strip()
-        return it["title"].strip() + (f"\n\n{notes}" if notes else "")
+def claude_prompt(items, list_name=None, image_path=None):
+    """The prompt sent to Claude Code for one to-do, or for several from a list.
+
+    Attached images are listed by absolute path so Claude can open them.
+    """
+    def paths(it):
+        return [image_path(n) for n in it.get("images") or ()] if image_path else []
+
     if len(items) == 1:
-        return one(items[0])
+        it = items[0]
+        notes = it["notes"].strip()
+        text = it["title"].strip() + (f"\n\n{notes}" if notes else "")
+        imgs = paths(it)
+        if imgs:
+            text += ("\n\nAttached image" + ("s" if len(imgs) > 1 else "") + " (open and look at "
+                     + ("them" if len(imgs) > 1 else "it") + "):\n" + "\n".join(imgs))
+        return text
     head = f"Here are the open to-dos for {list_name or 'this project'}. Work through them in order:"
     parts = []
     for i, it in enumerate(items, 1):
         notes = it["notes"].strip()
-        parts.append(f"{i}. {it['title'].strip()}" + ("\n   " + notes.replace("\n", "\n   ") if notes else ""))
+        part = f"{i}. {it['title'].strip()}" + ("\n   " + notes.replace("\n", "\n   ") if notes else "")
+        imgs = paths(it)
+        if imgs:
+            part += "\n   Attached images (open and look at them):\n" + "\n".join("   " + p for p in imgs)
+        parts.append(part)
     return head + "\n\n" + "\n".join(parts)
 
 
@@ -489,6 +506,8 @@ class Store:
         data = data or {}
         self.lists = [dict({"color": "blue", "folder": None}, **lst) for lst in data.get("lists", []) if lst.get("id")]
         self.items = [dict(ITEM_DEFAULTS, **it) for it in data.get("items", []) if it.get("id")]
+        for it in self.items:
+            it["images"] = list(it["images"] or ())
         self.settings = dict(DEFAULT_SETTINGS, **data.get("settings", {}))
         if not self.lists:
             self.lists = [{"id": new_id(), "name": "Reminders", "color": "blue", "folder": None}]
@@ -499,6 +518,59 @@ class Store:
         if fresh:
             try:
                 self.save()
+            except OSError:
+                pass
+        self._cleanup_images()
+
+    # -- images
+
+    @property
+    def images_dir(self):
+        return os.path.join(os.path.dirname(self.path), "images")
+
+    def image_path(self, name):
+        return os.path.join(self.images_dir, name)
+
+    def new_image_name(self, ext=".png"):
+        os.makedirs(self.images_dir, exist_ok=True)
+        return uuid.uuid4().hex[:16] + ext
+
+    def _referenced_images(self):
+        return {n for it in self.items for n in it["images"]}
+
+    def _cleanup_images(self):
+        """Delete image files no reminder uses (left by deletes that can't be undone any more)."""
+        try:
+            files = os.listdir(self.images_dir)
+        except OSError:
+            return
+        used = self._referenced_images()
+        for f in files:
+            if f not in used:
+                try:
+                    os.remove(self.image_path(f))
+                except OSError:
+                    pass
+
+    def add_images(self, item_id, names):
+        item = self.get_item(item_id)
+        if item and names:
+            item["images"] = item["images"] + [n for n in names if n not in item["images"]]
+            self.changed()
+
+    def remove_image(self, item_id, name):
+        item = self.get_item(item_id)
+        if not item or name not in item["images"]:
+            return
+        item["images"] = [n for n in item["images"] if n != name]
+        if name not in self._referenced_images():   # a repeat copy may share it
+            self.discard_image_file(name)
+        self.changed()
+
+    def discard_image_file(self, name):
+        if name not in self._referenced_images():
+            try:
+                os.remove(self.image_path(name))
             except OSError:
                 pass
 
@@ -547,6 +619,7 @@ class Store:
         item = dict(ITEM_DEFAULTS, id=new_id(), title=title, created=now_str(),
                     list_id=list_id or self.lists[0]["id"])
         item.update(fields)
+        item["images"] = list(item["images"] or ())
         if item["repeat"] != "none":
             item["repeat_anchor"] = item["due_date"]
         self._skip_past_alert(item, self.settings["default_hour"])
@@ -581,7 +654,7 @@ class Store:
         if done and item["repeat"] != "none" and item["due_date"]:
             d = next_occurrence(item, dt.datetime.now())
             nxt = dict(item, id=new_id(), done=False, completed_at=None, created=now_str(),
-                       due_date=d.isoformat(), alerted=None, snooze_until=None,
+                       due_date=d.isoformat(), alerted=None, snooze_until=None, images=list(item["images"]),
                        repeat_anchor=item.get("repeat_anchor") or item["due_date"])
             self.items.insert(self.items.index(item) + 1, nxt)
             # The completed one no longer repeats; the copy carries the series on.
