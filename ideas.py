@@ -33,6 +33,13 @@ DATA_FILE = os.environ.get("IDEAS_DATA") or os.path.join(GLib.get_user_data_dir(
 OLD_DATA_DIR = os.path.join(GLib.get_user_data_dir(), "reminders")
 OLD_AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "io.github.voidrlm.Reminders.desktop")
 TEAMS_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ideas_teams.py")
+MAIL_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ideas_mail.py")
+# Where to-dos are picked up from: name, helper script and its arguments.
+SOURCES = {
+    "teams": ("Teams", TEAMS_SCRIPT, []),
+    "gmail": ("Gmail", MAIL_SCRIPT, ["--source", "gmail"]),
+    "outlook": ("Outlook", MAIL_SCRIPT, ["--source", "outlook"]),
+}
 
 
 def migrate_old_data():
@@ -157,15 +164,16 @@ def launch_claude(folder, prompt, extra_dirs=(), marker=None):
     return None
 
 
-# ---------------------------------------------------------------- Microsoft Teams
+# ---------------------------------------------------------------- Teams, Gmail, Outlook
 
 
-class TeamsCheck:
-    """One run of ideas_teams.py: on_event(dict) for each line it prints, then on_done()."""
+class SourceCheck:
+    """One run of a helper (ideas_teams.py, ideas_mail.py): on_event(dict) for each line it prints, then on_done()."""
 
-    def __init__(self, request, login, on_event, on_done):
+    def __init__(self, source, request, login, on_event, on_done):
         self.on_event, self.on_done = on_event, on_done
-        argv = [sys.executable, TEAMS_SCRIPT, "--data-dir", os.path.dirname(DATA_FILE)] + (["--login"] if login else [])
+        _label, script, args = SOURCES[source]
+        argv = [sys.executable, script, *args, "--data-dir", os.path.dirname(DATA_FILE)] + (["--login"] if login else [])
         flags = Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
         self.proc = Gio.SubprocessLauncher.new(flags).spawnv(argv)       # raises GLib.Error
         stdin = self.proc.get_stdin_pipe()
@@ -485,7 +493,8 @@ class IdeasApp(Adw.Application):
         for title, items in (
             ("To-dos", [("New to-do", "<Control>n"), ("Search", "<Control>f"),
                         ("Show or hide completed", "<Control>h"), ("Paste an image", "<Control>v"),
-                        ("Check Teams for tasks", "<Control>t")]),
+                        ("Check Teams for tasks", "<Control>t"), ("Check Gmail for tasks", "<Control>g"),
+                        ("Check Outlook for tasks", "<Control>o")]),
             ("General", [("New list", "<Control><Shift>n"), ("Keyboard shortcuts", "<Control>question"),
                          ("Close window", "<Control>w"), ("Quit", "<Control>q")]),
         ):
@@ -519,7 +528,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.list_id = st.get("last_list") if self.store.get_list(st.get("last_list")) else self.store.lists[0]["id"]
         self._building = False
         self.pending_images = []
-        self.teams = None               # a TeamsCheck while one is running
+        self.checks = {}                # source -> the SourceCheck running for it
+        self.check_status = {}          # source -> what that check is doing
         self.git_state = {}             # list id -> repositories with something to commit or push
         self.git_busy = set()           # list ids being committed and pushed right now
         self._git_checking = self._git_again = self._closed = False
@@ -554,9 +564,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_close_request(self, _win):
         self._closed = True
         GLib.source_remove(self._git_timer)
-        if self.teams:
-            self.teams.cancel()
-            self.teams = None
+        for check in self.checks.values():
+            check.cancel()
+        self.checks.clear()
         self._clear_pending()
         st = self.store.settings
         st["window_maximized"] = self.is_maximized()
@@ -591,8 +601,11 @@ class MainWindow(Adw.ApplicationWindow):
         add("item-claude", lambda a, v: self.send_to_claude([v.get_string()]), "s")
         add("list-claude", lambda a, v: self.send_list_to_claude(v.get_string()), "s")
         add("list-push", lambda a, v: self.push_list(v.get_string()), "s")
-        add("teams-check", lambda *a: self.check_teams(), accels=["<Control>t"])
-        add("teams-login", lambda *a: self.check_teams(login=True))
+        add("teams-check", lambda *a: self.check_source("teams"), accels=["<Control>t"])
+        add("teams-login", lambda *a: self.check_source("teams", login=True))
+        add("gmail-check", lambda *a: self.check_source("gmail"), accels=["<Control>g"])
+        add("outlook-check", lambda *a: self.check_source("outlook"), accels=["<Control>o"])
+        add("outlook-login", lambda *a: self.check_source("outlook", login=True))
         show = Gio.SimpleAction.new_stateful("show-completed", None,
                                              GLib.Variant("b", self.store.settings["show_completed"]))
         show.connect("change-state", self._on_show_completed)
@@ -614,6 +627,11 @@ class MainWindow(Adw.ApplicationWindow):
         teams.append("Check Teams for Tasks", "win.teams-check")
         teams.append("Sign In to Teams…", "win.teams-login")
         menu.append_section(None, teams)
+        mail = Gio.Menu()
+        mail.append("Check Gmail for Tasks", "win.gmail-check")
+        mail.append("Check Outlook for Tasks", "win.outlook-check")
+        mail.append("Sign In to Outlook…", "win.outlook-login")
+        menu.append_section(None, mail)
         sec = Gio.Menu()
         sec.append("Keyboard Shortcuts", "app.shortcuts")
         sec.append("About Ideas", "app.about")
@@ -625,7 +643,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.teams_stack.add_named(Adw.Spinner(), "busy")
         self.teams_btn = Gtk.Button(child=self.teams_stack, action_name="win.teams-check")
         hb.pack_start(self.teams_btn)
-        self._teams_busy(False)
+        self._sync_busy()
         tv.add_top_bar(hb)
 
         self.sidebar_list = Gtk.ListBox(css_classes=["navigation-sidebar"])
@@ -1166,60 +1184,84 @@ class MainWindow(Adw.ApplicationWindow):
                            + join_names(r["name"] for r in ok))
         in_background(lambda: [gitx.commit_and_push(st["path"], smart) for st in repos], done)
 
-    # -- Microsoft Teams
+    # -- Teams, Gmail, Outlook
 
-    def _teams_busy(self, busy, status=None):
-        self.teams_stack.set_visible_child_name("busy" if busy else "idle")
+    def _sync_busy(self):
+        """The header button spins while any check runs; its tooltip says what they are doing."""
+        self.teams_stack.set_visible_child_name("busy" if self.checks else "idle")
+        status = "\n".join(self.check_status.get(src) or f"Checking {SOURCES[src][0]}…" for src in self.checks)
         self.teams_btn.set_tooltip_text(status or "Check Teams for Tasks (Ctrl+T)\n"
                                         "Reads your unread chats without marking them as read")
 
-    def check_teams(self, login=False):
-        """Look through unread Teams chats for things to do and add them to the Teams list."""
-        if self.teams:
+    def check_source(self, source, login=False):
+        """Look through unread Teams chats or email for things to do and add them to that source's list."""
+        if source in self.checks:
             return
+        label = SOURCES[source][0]
         got = {"answer": False}
 
         def on_event(ev):
             kind = ev.get("event")
             if kind == "status":
-                self._teams_busy(True, ev.get("text"))
+                self.check_status[source] = ev.get("text")
+                self._sync_busy()
                 if ev.get("toast"):
                     self.toast(ev.get("text", ""))
             elif kind == "login":
                 got["answer"] = True
-                self.toast("Sign in to Teams to check it for tasks", action=("Sign In", lambda: self.check_teams(login=True)))
+                self.toast(f"Sign in to {label} to check it for tasks",
+                           action=("Sign In", lambda: self.check_source(source, login=True)))
+            elif kind == "setup":
+                got["answer"] = True
+                self.toast(ev.get("text") or f"Set up {label} in Online Accounts",
+                           action=("Online Accounts", self._open_online_accounts))
             elif kind == "error":
                 got["answer"] = True
-                self.toast(ev.get("text") or "Teams check failed")
+                self.toast(ev.get("text") or f"{label} check failed")
             elif kind == "result":
                 got["answer"] = True
-                self._teams_result(ev)
+                self._source_result(source, ev)
 
         def on_done():
-            self.teams = None
-            self._teams_busy(False)
+            self.checks.pop(source, None)
+            self.check_status.pop(source, None)
+            self._sync_busy()
             if not got["answer"]:
-                self.toast("The Teams check stopped unexpectedly")
+                self.toast(f"The {label} check stopped unexpectedly")
 
+        request = self.store.teams_request() if source == "teams" else self.store.mail_request(source)
         try:
-            self.teams = TeamsCheck(self.store.teams_request(), login, on_event, on_done)
+            self.checks[source] = SourceCheck(source, request, login, on_event, on_done)
         except GLib.Error as e:
-            self.toast(f"Couldn't start the Teams check: {e.message}")
+            self.toast(f"Couldn't start the {label} check: {e.message}")
             return
-        self._teams_busy(True, "Checking Teams…")
+        self.check_status[source] = f"Checking {label}…"
+        self._sync_busy()
 
-    def _teams_result(self, ev):
-        added = self.store.add_teams_tasks(ev.get("tasks"), ev.get("checked"))
+    def _open_online_accounts(self):
+        try:
+            spawn(["gnome-control-center", "online-accounts"])
+        except GLib.Error:
+            self.toast("Open Settings → Online Accounts to add the account")
+
+    def _source_result(self, source, ev):
+        label = SOURCES[source][0]
+        if source == "teams":
+            added = self.store.add_teams_tasks(ev.get("tasks"), ev.get("checked"))
+            what = "new Teams message"
+        else:
+            added = self.store.add_mail_tasks(source, ev.get("tasks"), ev.get("checked"))
+            what = "new email"
         if not added:
             n = ev.get("messages") or 0
-            self.toast(f"No tasks for you in {plural(n, 'new Teams message')}" if n else "Nothing new in Teams")
+            self.toast(f"No tasks for you in {plural(n, what)}" if n else f"Nothing new in {label}")
             return
         ids = [it["id"] for it in added]
-        self.list_id = added[0]["list_id"]          # show the Teams list
+        self.list_id = added[0]["list_id"]          # show the list they went to
         if self.search_bar.get_search_mode():
             self.search_bar.set_search_mode(False)
         self.refresh(scroll_top=True)
-        self.toast(f"Added {plural(len(added), 'to-do')} from Teams", lambda: self.store.delete_items(ids))
+        self.toast(f"Added {plural(len(added), 'to-do')} from {label}", lambda: self.store.delete_items(ids))
 
     def send_to_claude(self, item_ids, list_id=None):
         items = [it for it in (self.store.get_item(i) for i in item_ids) if it]
@@ -1450,6 +1492,13 @@ class ItemDialog(Adw.Dialog):
             teams_row.connect("activated", lambda *_: Gtk.UriLauncher.new(item["teams_url"]).launch(self.win, None, None))
             gt.add(teams_row)
             page.add(gt)
+        if item.get("mail_url"):
+            where = "Gmail" if (item.get("mail_id") or "").startswith("gmail:") else "Outlook"
+            gm = Adw.PreferencesGroup(description=f"Opening the email in {where} may mark it as read.")
+            mail_row = Adw.ButtonRow(title=f"Open in {where}", start_icon_name="mail-unread-symbolic")
+            mail_row.connect("activated", lambda *_: Gtk.UriLauncher.new(item["mail_url"]).launch(self.win, None, None))
+            gm.add(mail_row)
+            page.add(gm)
 
         gx = Adw.PreferencesGroup()
         delete = Adw.ButtonRow(title="Delete To-do", start_icon_name="user-trash-symbolic",
