@@ -370,7 +370,11 @@ def parse_quick(text, now, list_names=()):
             if (m.group(1) or "").strip().lower() == "next" and d.isocalendar()[:2] == today.isocalendar()[:2]:
                 d += dt.timedelta(days=7)
             r["due_date"] = d
-        take(rf"\b(?:on\s+)?(next\s+|this\s+)?({_WD})\b", weekday)
+        # Full day names can stand alone; short ones ("sun", "sat", "wed") only after on/next/this,
+        # so "buy sun screen" stays a plain title.
+        full = "|".join(sorted((k for k in WEEKDAYS if len(k) > 4 or k == "friday"), key=len, reverse=True))
+        if not take(rf"\b(?:on\s+)?(next\s+|this\s+)?({full})\b", weekday):
+            take(rf"\b(?:on\s+|(next\s+|this\s+))({_WD})\b", weekday)
 
     # Times
     def set_time(h, mi=0):
@@ -414,8 +418,11 @@ def parse_quick(text, now, list_names=()):
         r["due_date"] = today
 
     title = re.sub(r"\s+", " ", s).strip()
-    title = re.sub(r"^(?:(?:on|at|by|due|in)\s+)+|(?:\s+(?:on|at|by|due|in|,))+$", "", title, flags=re.I).strip(" ,")
     found = r["due_date"] or r["priority"] or r["flagged"] or r["list_name"]
+    if found:
+        # Words left dangling where a date was cut out ("Pay rent on", "Call at").
+        title = re.sub(r"^(?:(?:on|at|by|due)\s+)+|(?:\s+(?:on|at|by|due|,))+$", "", title,
+                       flags=re.I).strip(" ,")
     if not title:
         # Nothing but date words: keep the text as the title rather than an empty reminder.
         title = text.strip()
@@ -470,7 +477,7 @@ class Store:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
         except FileNotFoundError:
-            pass
+            data = None
         except (OSError, ValueError):
             # Keep the unreadable file instead of overwriting it with an empty one.
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -478,6 +485,8 @@ class Store:
                 os.replace(self.path, f"{self.path}.broken-{stamp}")
             except OSError:
                 pass
+        fresh = data is None
+        data = data or {}
         self.lists = [dict({"color": "blue", "folder": None}, **lst) for lst in data.get("lists", []) if lst.get("id")]
         self.items = [dict(ITEM_DEFAULTS, **it) for it in data.get("items", []) if it.get("id")]
         self.settings = dict(DEFAULT_SETTINGS, **data.get("settings", {}))
@@ -487,6 +496,11 @@ class Store:
         for it in self.items:
             if it["list_id"] not in ids:
                 it["list_id"] = self.lists[0]["id"]
+        if fresh:
+            try:
+                self.save()
+            except OSError:
+                pass
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)

@@ -14,4 +14,4 @@ Actions=new-reminder;
 
 [Desktop Action new-reminder]
 Name=New Reminder
-Exec=reminders
+Exec=reminders --new

@@ -8,7 +8,6 @@ can notify on time; that can be turned off in Preferences.
 import datetime as dt
 import os
 import shutil
-import subprocess
 import sys
 
 import gi
@@ -93,6 +92,21 @@ def set_autostart(on):
             pass
 
 
+def spawn(argv, cwd=None):
+    """Start a program without waiting for it; GLib reaps it when it exits."""
+    GLib.spawn_async(argv, working_directory=cwd,
+                     flags=GLib.SpawnFlags.STDOUT_TO_DEV_NULL | GLib.SpawnFlags.STDERR_TO_DEV_NULL)
+
+
+def play_alert_sound():
+    player = shutil.which("pw-play") or shutil.which("paplay")
+    if player and os.path.exists(ALERT_SOUND):
+        try:
+            spawn([player, ALERT_SOUND])
+        except GLib.Error:
+            pass
+
+
 def find_claude():
     for p in (shutil.which("claude"), os.path.expanduser("~/.local/bin/claude"),
               os.path.expanduser("~/.claude/local/claude")):
@@ -127,14 +141,15 @@ def launch_claude(folder, prompt):
     term = next(((shutil.which(t), args) for t, args in TERMINALS if shutil.which(t)), None)
     if not term:
         return "No terminal app found"
+    if prompt.startswith("-"):
+        prompt = " " + prompt   # so claude doesn't read it as a command-line option
     # After Claude exits, stay in a shell in that folder instead of closing the window.
     script = 'cd "$1" || exit 1; "$2" "$3"; exec "${SHELL:-bash}" -l'
     cmd = [term[0], *term[1], "bash", "-lc", script, "claude-code", folder, claude, prompt]
     try:
-        subprocess.Popen(cmd, cwd=folder, start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as e:
-        return f"Couldn't open the terminal: {e}"
+        spawn(cmd, cwd=folder)
+    except GLib.Error as e:
+        return f"Couldn't open the terminal: {e.message}"
     return None
 
 
@@ -211,16 +226,19 @@ class RemindersApp(Adw.Application):
             return 0
         if "--background" not in args:
             self.activate()
+            if "--new" in args and self.window:
+                self.window.activate_action("win.new-reminder", None)
         return 0
 
     def do_activate(self):
-        if not self.window:
+        # GTK 4 doesn't emit "destroy" on close, so also check the window is still ours.
+        if self.window is None or self.window not in self.get_windows():
             self.window = MainWindow(self)
-            self.window.connect("destroy", self._on_window_destroy)
         self.window.present()
 
-    def _on_window_destroy(self, _w):
-        self.window = None
+    def window_closed(self, win):
+        if self.window is win:
+            self.window = None
 
     def _quit(self):
         if self._held:
@@ -254,10 +272,8 @@ class RemindersApp(Adw.Application):
             else:
                 for it in due:
                     self._notify(it)
-            if self.store.settings["sound"] and os.path.exists(ALERT_SOUND):
-                player = shutil.which("pw-play") or shutil.which("paplay")
-                if player:
-                    subprocess.Popen([player, ALERT_SOUND], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if self.store.settings["sound"]:
+                play_alert_sound()
         if self.window:
             self.window.maybe_refresh(now)
         return GLib.SOURCE_CONTINUE
@@ -276,9 +292,9 @@ class RemindersApp(Adw.Application):
         n.set_priority(Gio.NotificationPriority.HIGH)
         n.set_icon(Gio.ThemedIcon.new(APP_ID))
         target = GLib.Variant("s", item["id"])
-        n.set_default_action_and_target_value("app.open-item", target)
-        n.add_button_with_target_value("Mark as Done", "app.complete", target)
-        n.add_button_with_target_value(f"Snooze {self.store.settings['snooze_minutes']} min", "app.snooze", target)
+        n.set_default_action_and_target("app.open-item", target)
+        n.add_button_with_target("Mark as Done", "app.complete", target)
+        n.add_button_with_target(f"Snooze {self.store.settings['snooze_minutes']} min", "app.snooze", target)
         self.send_notification(f"item-{item['id']}", n)
 
     def _notify_summary(self, items):
@@ -297,10 +313,8 @@ class RemindersApp(Adw.Application):
         n.set_body("This is how your reminders will appear.")
         n.set_icon(Gio.ThemedIcon.new(APP_ID))
         self.send_notification("test", n)
-        if self.store.settings["sound"] and os.path.exists(ALERT_SOUND):
-            player = shutil.which("pw-play") or shutil.which("paplay")
-            if player:
-                subprocess.Popen([player, ALERT_SOUND], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.store.settings["sound"]:
+            play_alert_sound()
 
     def _open_item(self, item_id):
         self.activate()
@@ -369,7 +383,7 @@ class RemindersApp(Adw.Application):
     def _show_about(self):
         about = Adw.AboutDialog(
             application_name=APP_NAME, application_icon=APP_ID, version=VERSION,
-            developer_name="Arjun", license_type=Gtk.License.MIT_X11,
+            developer_name="Arjun",
             comments="Lists, to-dos and reminders that notify you on time.",
             website="https://github.com/voidrlm/reminders",
         )
@@ -381,7 +395,11 @@ class RemindersApp(Adw.Application):
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title=APP_NAME, default_width=980, default_height=680)
+        st = app.store.settings
+        super().__init__(application=app, title=APP_NAME,
+                         default_width=st.get("window_width", 980), default_height=st.get("window_height", 680))
+        if st.get("window_maximized"):
+            self.maximize()
         self.set_size_request(360, 400)
         self.app = app
         self.store = app.store
@@ -404,8 +422,18 @@ class MainWindow(Adw.ApplicationWindow):
         self._build_sidebar()
         self._build_content()
         self.store.connect(self._on_store_changed)
-        self.connect("destroy", lambda *_: self.store.disconnect(self._on_store_changed))
+        self.connect("close-request", self._on_close_request)
         self.refresh()
+
+    def _on_close_request(self, _win):
+        st = self.store.settings
+        st["window_maximized"] = self.is_maximized()
+        if not self.is_maximized():
+            st["window_width"], st["window_height"] = self.get_width(), self.get_height()
+        self.store.save()
+        self.store.disconnect(self._on_store_changed)
+        self.app.window_closed(self)
+        return False
 
     # -- actions
 
@@ -882,6 +910,8 @@ class MainWindow(Adw.ApplicationWindow):
         title = it["title"]
 
         def apply():
+            if check.get_active() != done:   # changed its mind before the delay ran out
+                return False
             nxt = self.store.set_done(item_id, done)
             if done:
                 self.app.withdraw(item_id)
@@ -1266,7 +1296,7 @@ class ItemDialog(Adw.Dialog):
     # -- save
 
     def _sync_claude(self):
-        lst = self.store.lists[self.list_row.get_selected()]
+        lst = self.store.lists[min(self.list_row.get_selected(), len(self.store.lists) - 1)]
         self.claude_group.set_visible(bool(lst.get("folder")))
         if lst.get("folder"):
             self.claude_group.set_description(f"Opens a terminal in {core.short_path(lst['folder'])} "
@@ -1296,7 +1326,7 @@ class ItemDialog(Adw.Dialog):
             "due_date": self._get_calendar().isoformat() if has_date else None,
             "due_time": self._get_time().strftime("%H:%M") if has_time else None,
             "repeat": core.REPEATS[self.repeat_row.get_selected()][0] if has_date else "none",
-            "list_id": self.store.lists[self.list_row.get_selected()]["id"],
+            "list_id": self.store.lists[min(self.list_row.get_selected(), len(self.store.lists) - 1)]["id"],
             "priority": self.priority_row.get_selected(),
             "flagged": self.flag_row.get_active(),
         }
@@ -1357,8 +1387,10 @@ class PrefsDialog(Adw.PreferencesDialog):
         where = Adw.ActionRow(title="Saved In", subtitle=DATA_FILE, subtitle_selectable=True)
         open_btn = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER, css_classes=["flat"],
                               tooltip_text="Open Folder")
-        open_btn.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
-            GLib.filename_to_uri(os.path.dirname(DATA_FILE)), None))
+        def open_folder(*_):
+            os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+            Gtk.FileLauncher.new(Gio.File.new_for_path(os.path.dirname(DATA_FILE))).launch(self.get_root(), None)
+        open_btn.connect("clicked", open_folder)
         where.add_suffix(open_btn)
         g3.add(where)
         page.add(g3)
