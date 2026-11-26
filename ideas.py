@@ -1407,13 +1407,25 @@ class MainWindow(Adw.ApplicationWindow):
         self.launch_box.set_visible(bool(shown and self.app.launchers))
         if not shown:
             return
+        # One split button: the main part opens Claude Code, the arrow lists every agent.
         where = core.short_path(folder)
-        for key in self.app.launchers:
-            btn = Gtk.Button(icon_name=LAUNCHERS[key]["icon"], css_classes=["flat", f"launch-{key}"],
-                             tooltip_text=f"Open {LAUNCHERS[key]['name']} in {where}")
-            btn.set_action_name("win.open-agent")
-            btn.set_action_target_value(GLib.Variant("s", key))
-            self.launch_box.append(btn)
+        default = "claude" if "claude" in self.app.launchers else next(iter(self.app.launchers))
+        tip = f"Open {LAUNCHERS[default]['name']} in {where}"
+        icon = Gtk.Image(icon_name=LAUNCHERS[default]["icon"], css_classes=[f"launch-{default}"])
+        if len(self.app.launchers) == 1:
+            btn = Gtk.Button(child=icon, css_classes=["flat"], tooltip_text=tip)
+        else:
+            menu = Gio.Menu()
+            for key in self.app.launchers:
+                item = Gio.MenuItem.new(LAUNCHERS[key]["name"], None)
+                item.set_action_and_target_value("win.open-agent", GLib.Variant("s", key))
+                menu.append_item(item)
+            btn = Adw.SplitButton(child=icon, menu_model=menu, tooltip_text=tip,
+                                  dropdown_tooltip=f"Open Another Agent in {where}")
+        btn.update_property([Gtk.AccessibleProperty.LABEL], [tip])
+        btn.set_action_name("win.open-agent")
+        btn.set_action_target_value(GLib.Variant("s", default))
+        self.launch_box.append(btn)
 
     def open_agent(self, agent):
         """Open a coding agent in the current list's folder, with nothing to do yet."""
