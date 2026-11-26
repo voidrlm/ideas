@@ -65,7 +65,7 @@ cd ideas && ./install.sh
 - **Fast capture.** Type and press <kbd>Enter</kbd>. `!`, `!!` or `!!!` set the priority, and `#ListName` files the to-do in another list.
 - **Notes and images.** Paste screenshots with <kbd>Ctrl</kbd>+<kbd>V</kbd>, drag and drop images, or add them from a folder.
 - **Send to Claude Code, Codex or OpenRouter.** Link a list to a project folder and every to-do gets a button for each coding agent you have. [More below](#send-to-claude-code).
-- **Commit and push.** A list whose folder has uncommitted work shows a push button. It commits with a generated message and pushes, even across several repositories in one folder.
+- **Commit and push.** A list whose folder holds a git repository (the folder itself or any subfolder) shows a push button, highlighted when there is work to push. It commits with a generated message and pushes, even across several repositories in one folder.
 - **Tasks from Microsoft Teams** (optional). Pulls the things people asked you to do in unread Teams chats into a list, without marking anything as read. [More below](#tasks-from-microsoft-teams).
 - **Undo** for deletes and completions, and a full set of keyboard shortcuts.
 - **Private.** Everything is kept in one JSON file on your computer. No account, no cloud, no tracking.
@@ -104,10 +104,13 @@ Console, kitty, foot, WezTerm, Alacritty, Konsole or xterm.
 
 ## Commit and push
 
-When a list's folder has uncommitted (or unpushed) work, a push button appears in the sidebar. It shows
-what changed, then commits everything with a message written by the bundled
+When a list's folder is a git repository, or has repositories in its subfolders (up to four levels down,
+skipping hidden folders and `node_modules`, `venv`, `dist` and the like), a push button appears in the
+sidebar. It is highlighted when there is uncommitted or unpushed work and dimmed when everything is up to
+date. Clicking it shows what changed, then commits everything with a message written by the bundled
 [`smart-commit`](smart-commit) script, in the repository's own commit style, and runs `git push`. A folder
-holding several repositories, say a backend and a frontend, is handled in one go. If a push fails, the
+holding several repositories, say `apps/web` and `apps/api`, is handled in one go; a repository nested
+inside another is committed on its own and never swallowed into the outer one. If a push fails, the
 commit is kept and the button pushes it next time.
 
 `smart-commit` works on its own from a terminal too: `./smart-commit --help`.

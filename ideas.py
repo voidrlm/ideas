@@ -72,7 +72,9 @@ def build_css():
     .agent-btn.sent { background-color: transparent; color: inherit; opacity: 0.55; }
     .agent-btn.sent:hover { background-color: alpha(currentColor, 0.1); opacity: 1; }
     .launch-box { margin: 0 2px; }
-    .git-btn { min-width: 26px; min-height: 26px; padding: 0; margin: -4px 0; color: var(--accent-color); }
+    .git-btn { min-width: 26px; min-height: 26px; padding: 0; margin: -4px 0; opacity: 0.45; }
+    .git-btn:hover { opacity: 1; }
+    .git-btn.dirty { color: var(--accent-color); opacity: 1; }
     .git-files { font-family: monospace; font-size: 0.9em; }
     """
     for key, agent in AGENTS.items():
@@ -661,7 +663,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.pending_images = []
         self.checks = {}                # source -> the SourceCheck running for it
         self.check_status = {}          # source -> what that check is doing
-        self.git_state = {}             # list id -> repositories with something to commit or push
+        self.git_state = {}             # list id -> every repository under its folder (with what is uncommitted or unpushed)
         self.git_busy = set()           # list ids being committed and pushed right now
         self._git_checking = self._git_again = self._closed = False
 
@@ -818,8 +820,11 @@ class MainWindow(Adw.ApplicationWindow):
                 box.append(Gtk.Button(child=Adw.Spinner(), css_classes=["flat", "circular", "git-btn"], sensitive=False,
                                       valign=Gtk.Align.CENTER, tooltip_text="Committing and pushing…"))
             elif self.git_state.get(lst["id"]):
-                push = Gtk.Button(icon_name="send-to-symbolic", css_classes=["flat", "circular", "git-btn"],
-                                  valign=Gtk.Align.CENTER, tooltip_text=self._git_summary(self.git_state[lst["id"]]))
+                repos = self.git_state[lst["id"]]
+                dirty = any(gitx.has_work(st) for st in repos)
+                push = Gtk.Button(icon_name="git-push-symbolic", valign=Gtk.Align.CENTER,
+                                  css_classes=["flat", "circular", "git-btn"] + (["dirty"] if dirty else []),
+                                  tooltip_text=self._git_summary(repos))
                 push.connect("clicked", lambda _b, lid=lst["id"]: self.push_list(lid))
                 box.append(push)
             n = counts.get(lst["id"], 0)
@@ -862,7 +867,7 @@ class MainWindow(Adw.ApplicationWindow):
             cc = Gio.Menu()
             for key in self.app.agents:
                 cc.append(f"Send Open To-dos to {AGENTS[key]['name']}", f"win.list-agent::{key}:{list_id}")
-            if self.git_state.get(list_id) and list_id not in self.git_busy:
+            if self._git_dirty(list_id) and list_id not in self.git_busy:
                 cc.append("Commit and Push Changes…", f"win.list-push::{list_id}")
             menu.append_section(None, cc)
         menu.append("Edit List…", f"win.edit-list::{list_id}")
@@ -1224,6 +1229,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     # -- git: commit and push a list's folder
 
+    def _git_dirty(self, list_id):
+        return any(gitx.has_work(st) for st in self.git_state.get(list_id, ()))
+
     @staticmethod
     def _git_summary(repos):
         parts = []
@@ -1231,8 +1239,9 @@ class MainWindow(Adw.ApplicationWindow):
             what = [plural(len(st["files"]), "uncommitted change")] if st["files"] else []
             if st["ahead"]:
                 what.append(plural(st["ahead"], "unpushed commit"))
-            parts.append(f"{st['name']}: {' and '.join(what)}")
-        return "Commit and push\n" + "\n".join(parts)
+            parts.append(f"{st['name']}: {' and '.join(what) or 'up to date'}")
+        dirty = any(gitx.has_work(st) for st in repos)
+        return ("Commit and push" if dirty else "Nothing to push") + "\n" + "\n".join(parts)
 
     def refresh_git(self):
         """Look (in the background) for uncommitted or unpushed work in the lists' folders."""
@@ -1257,7 +1266,7 @@ class MainWindow(Adw.ApplicationWindow):
             if self._git_again:
                 self._git_again = False
                 self.refresh_git()
-        in_background(lambda: {lid: st for lid, st in ((lid, gitx.folder_status(f)) for lid, f in folders.items()) if st}, done)
+        in_background(lambda: {lid: st for lid, st in ((lid, gitx.folder_repos(f)) for lid, f in folders.items()) if st}, done)
 
     def push_list(self, list_id):
         """Commit everything uncommitted under the list's folder and push it, after a look at what that is."""
@@ -1330,7 +1339,11 @@ class MainWindow(Adw.ApplicationWindow):
             elif ok:
                 self.toast(("Committed and pushed " if any(r["committed"] for r in ok) else "Pushed ")
                            + join_names(r["name"] for r in ok))
-        in_background(lambda: [gitx.commit_and_push(st["path"], smart) for st in repos], done)
+        everything = [st["path"] for st in self.git_state.get(list_id, ())] + [st["path"] for st in repos]
+
+        def nested(path):
+            return [p for p in everything if p != path and p.startswith(path.rstrip(os.sep) + os.sep)]
+        in_background(lambda: [gitx.commit_and_push(st["path"], smart, st["name"], nested(st["path"])) for st in repos], done)
 
     # -- Microsoft Teams
 
